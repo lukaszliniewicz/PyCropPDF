@@ -4,7 +4,7 @@ A small PDF cropping tool that lets you see all pages overlaid while cropping - 
 
 https://github.com/user-attachments/assets/0f1c7ae7-f273-4116-852d-9dc271cbc43f
 
-## Key Features
+## Features
 
 - **Visual Overlay Cropping**: See all pages overlaid while selecting crop boundaries, making it easy to avoid cutting off content
 - **Batch Processing**: Crop all pages, or all odd/even pages at once with a single selection
