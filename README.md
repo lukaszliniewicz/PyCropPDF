@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/0f1c7ae7-f273-4116-852d-9dc271cbc43f
 Clone the repository:
 
 ```
-git clone https://github.com/lukaszliniewicz/PyCropPDF)
+git clone https://github.com/lukaszliniewicz/PyCropPDF
 ```
 In the the PyCropPDF directory execute:
 
