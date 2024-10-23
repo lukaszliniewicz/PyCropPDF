@@ -27,7 +27,7 @@ Clone the repository:
 ```
 git clone https://github.com/lukaszliniewicz/PyCropPDF
 ```
-In the the PyCropPDF directory execute:
+In the PyCropPDF directory execute:
 
 ```
 pip install -r requirements.txt
