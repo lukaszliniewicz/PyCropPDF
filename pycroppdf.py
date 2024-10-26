@@ -84,6 +84,7 @@ class PDFViewer(QMainWindow):
         self.original_pdf_path = None 
         self.view_mode = 'all'
         self.save_directory = save_directory
+        self.save_filename = save_filename
         
         # Create views
         self.single_view = PageGraphicsView()
@@ -712,10 +713,14 @@ class PDFViewer(QMainWindow):
 
         try:
             if self.save_directory:
-                # Generate filename based on input filename
-                original_name = os.path.basename(self.pdf_path)
-                base_name = os.path.splitext(original_name)[0]
-                save_path = os.path.join(self.save_directory, f"{base_name}_modified.pdf")
+                if self.save_filename:
+                    # Use the provided filename
+                    save_path = os.path.join(self.save_directory, self.save_filename)
+                else:
+                    # Generate filename based on input filename
+                    original_name = os.path.basename(self.pdf_path)
+                    base_name = os.path.splitext(original_name)[0]
+                    save_path = os.path.join(self.save_directory, f"{base_name}_modified.pdf")
             else:
                 save_path, _ = QFileDialog.getSaveFileName(
                     self,
@@ -759,6 +764,7 @@ def main():
     parser = argparse.ArgumentParser(description='PDF Overlay Viewer')
     parser.add_argument('--input', type=str, help='Path to input PDF file')
     parser.add_argument('--save-to', type=str, help='Directory to save modified PDF')
+    parser.add_argument('--save-as', type=str, help='Filename for the saved modified PDF')
     
     args = parser.parse_args()
 
@@ -773,7 +779,7 @@ def main():
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    viewer = PDFViewer(input_pdf=args.input, save_directory=args.save_to)
+    viewer = PDFViewer(input_pdf=args.input, save_directory=args.save_to, save_filename=args.save_as)
     viewer.show()
     sys.exit(app.exec())
 
