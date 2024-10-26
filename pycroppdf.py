@@ -75,7 +75,7 @@ class ThumbnailWidget(QWidget):
         self.setLayout(layout)
 
 class PDFViewer(QMainWindow):
-    def __init__(self, input_pdf=None, save_directory=None):
+    def __init__(self, input_pdf=None, save_directory=None, save_filename=None):
         super().__init__()
         self.images = []
         self.setAcceptDrops(True)
