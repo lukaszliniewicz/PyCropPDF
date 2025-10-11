@@ -1,8 +1,6 @@
 # PyCropPDF
 
-A PDF cropping utility for removing headers, footers, and margins from multiple pages at once. It provides a visual overlay of pages to help define a consistent crop area.
-
-https://github.com/user-attachments/assets/0f1c7ae7-f273-4116-852d-9dc271cbc43f
+PyCropPDF is a user-friendly utility for cropping PDF documents. It excels at tasks like removing headers, footers, or margins across multiple pages simultaneously. By overlaying pages, it allows you to define a crop area with precision, ensuring consistency throughout your document. It supports different crop areas for odd and even pages, catering to documents with mirrored margin layouts.
 
 ## Features
 
@@ -66,33 +64,7 @@ Or with arguments:
 ```bash
 pycroppdf --input /path/to/your.pdf
 ```
-```
-This seems a bit verbose. Maybe simplify it.
 
-How about this for the "Running from source" section:
+## Legacy Usage
 
-```markdown
-README.md
-<<<<<<< SEARCH
-### Running from source
-After following the installation steps for running from source, you can run the application directly. As the package is installed in editable mode, the `pycroppdf` command will also work.
-
-```bash
-python run.py
-# or
-pycroppdf
-```
-You can also provide a PDF file to open on startup:
-```bash
-pycroppdf --input /path/to/your.pdf
-```
-
-### As an installed package
-After installing the package, you can run the application from any directory:
-```bash
-pycroppdf
-```
-Or with arguments:
-```bash
-pycroppdf --input /path/to/your.pdf
-```
+For backward compatibility, a `pycroppdf.py` script is maintained at the root of the repository. This script is a wrapper that ensures older programmatic workflows continue to function after recent project restructuring. It is considered deprecated and will be removed in a future version.

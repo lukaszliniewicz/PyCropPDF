@@ -722,6 +722,22 @@ class PDFViewer(QMainWindow):
 
         try:
             self.invalidate_pixmap_cache()
+
+            # Remap crop rectangles if a crop is active
+            if self.active_crop_info and 'rects' in self.active_crop_info:
+                new_crop_rects = {}
+                current_page_index = 0
+                original_rects = self.active_crop_info['rects']
+                # Use non-reversed list for set for efficiency
+                deleted_set = set(self.getSelectedPages())
+
+                for i in range(len(self.pdf_doc)):
+                    if i not in deleted_set:
+                        if i in original_rects:
+                            new_crop_rects[current_page_index] = original_rects[i]
+                        current_page_index += 1
+                self.active_crop_info['rects'] = new_crop_rects
+
             for page_num in selected_pages:
                 self.pdf_doc.delete_page(page_num)
                 self.images.pop(page_num)
