@@ -3,6 +3,8 @@
 
 A GUI application to crop PDF files. It is primarily designed for documents where multiple pages need the same cropping, such as removing headers, footers, or margins.
 
+![python_Kk7XZgDZLZ](https://github.com/user-attachments/assets/f626c86e-8799-4f54-98e0-4342649fac64)
+
 ## Features
 
 -   **Visual Cropping:** Draw a crop box directly on a preview of your PDF.
