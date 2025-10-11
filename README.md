@@ -40,23 +40,16 @@ pip install git+https://github.com/lukaszliniewicz/PyCropPDF.git
 ```
 This will install the application and make the `pycroppdf` command available in your system's PATH.
 
-## Usage
 
-### Running from source
-After following the installation steps for running from source, you can run the application directly. As the package is installed in editable mode, the `pycroppdf` command will also work.
-
+### As an installed package
+>>>>>>> 0e5eed5418b7fe375f40f725ba3df7034150a1b1
+After installing the package, you can run the application from any directory:
 ```bash
-python run.py
-# or
 pycroppdf
 ```
-<<<<<<< HEAD
-You can also provide a PDF file to open on startup:
+Or with arguments:
 ```bash
-pycroppdf --input /path/to/your.pdf
-```
-
-### As a package
+>>>>>>> 0e5eed5418b7fe375f40f725ba3df7034150a1b1
 =======
 
 ### As an installed package
@@ -67,12 +60,6 @@ pycroppdf
 ```
 Or with arguments:
 ```bash
-pycroppdf --input /path/to/your.pdf
-```
-<<<<<<< HEAD
-
-## Legacy Usage
-
-For backward compatibility, a `pycroppdf.py` script is maintained at the root of the repository. This script is a wrapper that ensures older programmatic workflows continue to function after recent project restructuring. It is considered deprecated and will be removed in a future version.
+>>>>>>> 0e5eed5418b7fe375f40f725ba3df7034150a1b1
 =======
 >>>>>>> 0e5eed5418b7fe375f40f725ba3df7034150a1b1
