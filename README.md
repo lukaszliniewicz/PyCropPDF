@@ -52,40 +52,6 @@ python run.py
 # or
 pycroppdf
 ```
-You can also provide a PDF file to open on startup:
-```bash
-pycroppdf --input /path/to/your.pdf
-```
-
-### As a package
-After installing the package, you can run the application from any directory:
-```bash
-pycroppdf
-```
-Or with arguments:
-```bash
-pycroppdf --input /path/to/your.pdf
-```
-```
-This seems a bit verbose. Maybe simplify it.
-
-How about this for the "Running from source" section:
-
-```markdown
-README.md
-<<<<<<< SEARCH
-### Running from source
-After following the installation steps for running from source, you can run the application directly. As the package is installed in editable mode, the `pycroppdf` command will also work.
-
-```bash
-python run.py
-# or
-pycroppdf
-```
-You can also provide a PDF file to open on startup:
-```bash
-pycroppdf --input /path/to/your.pdf
-```
 
 ### As an installed package
 After installing the package, you can run the application from any directory:
