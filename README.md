@@ -15,15 +15,23 @@ A GUI application to crop PDF files. It is primarily designed for documents wher
 
 ## Installation
 
-1.  Ensure you have Python 3.8 or newer and git installed.
-2.  Clone the repository and install the package:
+You can install PyCropPDF directly from GitHub. Ensure you have Python 3.8+ and git installed.
 
-    ```bash
-    git clone https://github.com/lukaszliniewicz/PyCropPDF.git
-    cd PyCropPDF
-    pip install -e .
-    ```
-    This will install the package in editable mode and handle all dependencies.
+### Recommended Method
+Use pip to install directly from the repository:
+```bash
+pip install git+https://github.com/lukaszliniewicz/PyCropPDF.git
+```
+This command will handle downloading and installing the package and its dependencies.
+
+### Development / Editable Install
+If you plan to modify the code, clone the repository and install it in "editable" mode:
+```bash
+git clone https://github.com/lukaszliniewicz/PyCropPDF.git
+cd PyCropPDF
+pip install -e .
+```
+This will install the package in editable mode and handle all dependencies.
 
 ## Usage
 
