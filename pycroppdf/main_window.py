@@ -313,7 +313,13 @@ class PDFViewer(QMainWindow):
                 self.odd_view.setSelection(selection)
 
     def showHelp(self):
-        help_text = """<b>Basic Usage:</b>
+        help_text = """<b>Installation (from source):</b>
+<ol>
+<li>Clone the repository:<br><code>git clone https://github.com/lukaszliniewicz/PyCropPDF.git</code></li>
+<li>Navigate into the directory:<br><code>cd PyCropPDF</code></li>
+<li>Install the package in editable mode:<br><code>pip install -e .</code></li>
+</ol>
+<br><b>Basic Usage:</b>
 <ol>
 <li>Open a PDF using <b>File > Open PDF...</b> or by dragging it into the window.</li>
 <li>Select a crop area by clicking and dragging on the page view(s).</li>
