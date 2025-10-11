@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycroppdf"
+version = "0.1.0"
+authors = [
+  { name="Lukasz Liniewicz" },
+]
+description = "A PDF cropping utility for removing headers, footers, and margins from multiple pages at once."
+readme = "README.md"
+license = { file="LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "PyMuPDF",
+    "PyQt6",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/lukaszliniewicz/PyCropPDF"
+
+[project.scripts]
+pycroppdf = "pycroppdf.run:main"
