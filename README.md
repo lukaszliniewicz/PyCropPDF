@@ -34,6 +34,18 @@ You can also provide a PDF file to open on startup:
 python run.py --input /path/to/your/document.pdf
 ```
 
+### Programmatic Use & Command-Line Arguments
+
+The application supports command-line arguments that can be useful in scripts or automated workflows that still require manual user input (e.g., for selecting crop boxes).
+
+-   `--input /path/to/file.pdf`: Opens a PDF on startup.
+-   `--save-to /path/to/directory/`: Sets the directory for saving the modified PDF.
+-   `--save-as filename.pdf`: Sets the filename for the saved PDF.
+
+When `--save-to` or `--save-as` are used, the "Save" dialog is skipped, and the file is saved directly to the specified location after the user clicks "Save PDF..." in the File menu.
+
+A `pycroppdf.py` script is included for backward compatibility with existing programmatic usage; it is a simple wrapper for `run.py`.
+
 ### Basic Workflow
 
 1.  Launch the application.
