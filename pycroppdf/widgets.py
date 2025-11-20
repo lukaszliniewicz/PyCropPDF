@@ -198,11 +198,17 @@ class ThumbnailWidget(QWidget):
         self.page_num = page_num
         
         # Create thumbnail
-        thumbnail = image.scaled(QSize(80, 120), 
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
         self.label = QLabel()
-        self.label.setPixmap(QPixmap.fromImage(thumbnail))
+        if image:
+            thumbnail = image.scaled(QSize(80, 120),
+                                   Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
+            self.label.setPixmap(QPixmap.fromImage(thumbnail))
+        else:
+            # Placeholder for missing image
+            placeholder = QPixmap(80, 120)
+            placeholder.fill(Qt.GlobalColor.lightGray)
+            self.label.setPixmap(placeholder)
         self.label.installEventFilter(self)
         
         layout.addWidget(self.checkbox)
