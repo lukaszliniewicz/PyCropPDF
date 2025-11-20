@@ -710,7 +710,7 @@ class PDFViewer(QMainWindow):
         self.active_crop_info = {
             'rects': crop_rects,
             'view_mode': self.view_mode,
-            'image_dims': [(img.width(), img.height()) for img in self.images]
+            'image_dims': [(img.width(), img.height()) for img in self.images if img]
         }
         
         self.show_crop_success_msg = True
