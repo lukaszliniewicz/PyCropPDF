@@ -53,8 +53,8 @@ def _translate_rect_to_pdf_coords(scene_rect, page_dims, page_media_box, page_nu
 
 def _render_page_task(args):
     """Renders a single PDF page. For use with ProcessPoolExecutor."""
-    pdf_path, page_num, zoom_matrix, crop_args = args
-    pdf_doc = fitz.open(pdf_path)
+    pdf_bytes, page_num, zoom_matrix, crop_args = args
+    pdf_doc = fitz.open("pdf", pdf_bytes)
     page = pdf_doc[page_num]
 
     clip_rect = None
@@ -85,10 +85,10 @@ class RenderAllPagesWorker(QRunnable):
     """
     Worker thread for rendering all PDF pages in parallel.
     """
-    def __init__(self, pdf_path, num_pages, crop_info=None):
+    def __init__(self, pdf_bytes, num_pages, crop_info=None):
         super().__init__()
         self.signals = WorkerSignals()
-        self.pdf_path = pdf_path
+        self.pdf_bytes = pdf_bytes
         self.num_pages = num_pages
         self.crop_info = crop_info
 
@@ -124,7 +124,7 @@ class RenderAllPagesWorker(QRunnable):
                         'max_even_dims': max_even_dims,
                     }
 
-            tasks = [(self.pdf_path, i, zoom_matrix, crop_args_list[i]) for i in range(self.num_pages)]
+            tasks = [(self.pdf_bytes, i, zoom_matrix, crop_args_list[i]) for i in range(self.num_pages)]
 
             with concurrent.futures.ProcessPoolExecutor() as executor:
                 for page_num, samples, width, height, stride in executor.map(_render_page_task, tasks):

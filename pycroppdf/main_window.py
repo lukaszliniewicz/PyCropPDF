@@ -417,7 +417,8 @@ class PDFViewer(QMainWindow):
         self.images = [None] * num_pages
         self.pages_rendered = 0
         
-        worker = RenderAllPagesWorker(self.pdf_path, num_pages, self.active_crop_info)
+        pdf_bytes = self.pdf_doc.tobytes()
+        worker = RenderAllPagesWorker(pdf_bytes, num_pages, self.active_crop_info)
         worker.signals.result.connect(self.pageRendered)
         worker.signals.error.connect(self.processingError)
         worker.signals.finished.connect(self.processingFinished)
