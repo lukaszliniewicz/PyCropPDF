@@ -473,8 +473,11 @@ class PDFViewer(QMainWindow):
         
         if self.single_view_pixmap_cache is None:
             # Find maximum dimensions
-            max_width = max(img.width() for img in self.images)
-            max_height = max(img.height() for img in self.images)
+            valid_images = [img for img in self.images if img]
+            if not valid_images:
+                return
+            max_width = max(img.width() for img in valid_images)
+            max_height = max(img.height() for img in valid_images)
             
             # Create a transparent base image of maximum size
             base_img = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
@@ -484,14 +487,14 @@ class PDFViewer(QMainWindow):
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
             # Draw first page fully opaque
-            img = self.images[0]
+            img = valid_images[0]
             x = (max_width - img.width()) // 2
             y = (max_height - img.height()) // 2
             painter.setOpacity(1.0)
             painter.drawImage(x, y, img)
 
             # Draw remaining pages semi-transparent
-            for img in self.images[1:]:
+            for img in valid_images[1:]:
                 x = (max_width - img.width()) // 2
                 y = (max_height - img.height()) // 2
                 painter.setOpacity(0.2)
@@ -512,11 +515,14 @@ class PDFViewer(QMainWindow):
         self.even_view.clearScene()
 
         # Find maximum dimensions across ALL pages to ensure consistent canvas size
-        max_width = max(img.width() for img in self.images)
-        max_height = max(img.height() for img in self.images)
+        valid_images = [img for img in self.images if img]
+        if not valid_images:
+            return
+        max_width = max(img.width() for img in valid_images)
+        max_height = max(img.height() for img in valid_images)
 
         # Process odd pages
-        odd_pages = self.images[::2]
+        odd_pages = [img for img in self.images[::2] if img]
         if odd_pages:
             if self.odd_view_pixmap_cache is None:
                 base_odd = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
@@ -547,7 +553,7 @@ class PDFViewer(QMainWindow):
             self.odd_view.fitInView(self.odd_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
         # Process even pages
-        even_pages = self.images[1::2]
+        even_pages = [img for img in self.images[1::2] if img]
         if even_pages:
             if self.even_view_pixmap_cache is None:
                 base_even = QImage(max_width, max_height, QImage.Format.Format_ARGB32)

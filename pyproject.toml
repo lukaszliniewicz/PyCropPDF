@@ -9,7 +9,7 @@ authors = [
   { name="Lukasz Liniewicz" },
 ]
 description = "A PDF cropping utility for removing headers, footers, and margins from multiple pages at once."
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 license = { file="LICENSE" }
 requires-python = ">=3.8"
 classifiers = [
