@@ -810,7 +810,9 @@ class PDFViewer(QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.updateOverlay()
+        # Only update overlay if a PDF is loaded
+        if self.pdf_doc:
+            self.updateOverlay()
 
     def closeEvent(self, event):
         if self.pdf_doc:
