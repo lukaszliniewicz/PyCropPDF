@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QCheckBox, QGraphicsScene, QGraphicsView, QLabel,
 class PageGraphicsView(QGraphicsView):
     selectionChanged = pyqtSignal(QRectF)
     colorPicked = pyqtSignal(QColor)
+    whiteoutRequested = pyqtSignal(QRectF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -20,7 +21,8 @@ class PageGraphicsView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setMouseTracking(True)
         
-        self._mode = 'none'  # 'none', 'draw', 'move', 'resize', 'pick_color'
+        self._mode = 'none'  # 'none', 'draw', 'move', 'resize'
+        self._tool = 'select' # 'select', 'whiteout', 'pick_color'
         self._resize_handle = None
         self._start_pos = None
         self._original_rect = None
@@ -31,12 +33,15 @@ class PageGraphicsView(QGraphicsView):
         self._last_pan_pos = QPointF()
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
 
-    def setMode(self, mode):
-        self._mode = mode
-        if mode == 'pick_color':
+    def setTool(self, tool):
+        self._tool = tool
+        if tool in ['pick_color', 'whiteout']:
             self.setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        if tool != 'select':
+            self.clearSelection()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
@@ -82,7 +87,7 @@ class PageGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            if self._mode == 'pick_color':
+            if self._tool == 'pick_color':
                 pos = self.mapToScene(event.pos())
                 items = self.scene.items(pos)
                 for item in items:
@@ -95,13 +100,22 @@ class PageGraphicsView(QGraphicsView):
                         if 0 <= x < pixmap.width() and 0 <= y < pixmap.height():
                             color = pixmap.toImage().pixelColor(x, y)
                             self.colorPicked.emit(color)
-                            self.setMode('none')
+                            self.setTool('select')
                             return
                 return
 
             if self._pan:
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self._last_pan_pos = event.pos()
+                return
+
+            if self._tool == 'whiteout':
+                pos = self.mapToScene(event.pos())
+                self._start_pos = pos
+                self._mode = 'draw'
+                if self.selection_item:
+                    self.scene.removeItem(self.selection_item)
+                    self.selection_item = None
                 return
 
             pos = self.mapToScene(event.pos())
@@ -123,7 +137,7 @@ class PageGraphicsView(QGraphicsView):
 
 
     def mouseMoveEvent(self, event):
-        if self._mode == 'pick_color':
+        if self._tool == 'pick_color':
             return
 
         if self._pan:
@@ -173,6 +187,20 @@ class PageGraphicsView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             if self._pan:
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
+                return
+
+            if self._tool == 'whiteout' and self._mode == 'draw':
+                rect = QRectF(self._start_pos, self.mapToScene(event.pos())).normalized()
+                if rect.isValid() and not rect.isNull():
+                    self.whiteoutRequested.emit(rect)
+                
+                # Cleanup drawing artifact
+                if self.selection_item:
+                    self.scene.removeItem(self.selection_item)
+                    self.selection_item = None
+                
+                self._mode = 'none'
+                self._start_pos = None
                 return
 
             if self._mode in ['draw', 'move', 'resize']:

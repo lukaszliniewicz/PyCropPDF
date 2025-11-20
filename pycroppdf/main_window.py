@@ -55,6 +55,10 @@ class PDFViewer(QMainWindow):
         self.odd_view.colorPicked.connect(self.onColorPicked)
         self.even_view.colorPicked.connect(self.onColorPicked)
 
+        self.single_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
+        self.odd_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
+        self.even_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
+
         self.initUI()
         self.showMaximized()
 
@@ -202,9 +206,10 @@ class PDFViewer(QMainWindow):
         toolbar.addSeparator()
 
         # Add White Out button
-        self.whiteout_btn = QPushButton('White Out Selection')
-        self.whiteout_btn.setMinimumWidth(120)
-        self.whiteout_btn.clicked.connect(self.whiteoutSelection)
+        self.whiteout_btn = QPushButton('White Out')
+        self.whiteout_btn.setCheckable(True)
+        self.whiteout_btn.setMinimumWidth(80)
+        self.whiteout_btn.clicked.connect(self.toggleWhiteoutTool)
         toolbar.addWidget(self.whiteout_btn)
 
         # Add Color Picker button
@@ -279,13 +284,40 @@ class PDFViewer(QMainWindow):
         self.reloadImages()
         QMessageBox.information(self, "Success", "Crop has been reset.")
 
+    def toggleWhiteoutTool(self):
+        is_active = self.whiteout_btn.isChecked()
+        tool = 'whiteout' if is_active else 'select'
+        
+        self.single_view.setTool(tool)
+        self.odd_view.setTool(tool)
+        self.even_view.setTool(tool)
+        
+        if is_active:
+            self.crop_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+        else:
+            self.crop_btn.setEnabled(True)
+            self.delete_btn.setEnabled(True)
+
     def pickColor(self):
-        self.current_view.setMode('pick_color')
+        # Deactivate whiteout tool if active
+        if self.whiteout_btn.isChecked():
+            self.whiteout_btn.setChecked(False)
+            self.toggleWhiteoutTool()
+
+        self.single_view.setTool('pick_color')
+        self.odd_view.setTool('pick_color')
+        self.even_view.setTool('pick_color')
+        
         QMessageBox.information(self, "Pick Color", "Click on the page to select a color for whiteout.")
 
     def onColorPicked(self, color):
         self.whiteout_color = (color.redF(), color.greenF(), color.blueF())
         QMessageBox.information(self, "Color Picked", f"Whiteout color set to RGB({int(color.red())}, {int(color.green())}, {int(color.blue())})")
+        # Restore select tool
+        self.single_view.setTool('select')
+        self.odd_view.setTool('select')
+        self.even_view.setTool('select')
 
     def pushUndo(self):
         if self.pdf_doc:
@@ -768,7 +800,7 @@ class PDFViewer(QMainWindow):
         self.show_crop_success_msg = True
         self.reloadImages()
 
-    def whiteoutSelection(self):
+    def handleWhiteoutRequest(self, rect):
         if self.is_processing or not self.pdf_doc:
             return
 
@@ -776,29 +808,24 @@ class PDFViewer(QMainWindow):
             QMessageBox.warning(self, "Warning", "Cannot apply whiteout while a crop is active. Please Reset Crop first.")
             return
 
-        # Get selection
-        selection_rect = None
+        sender = self.sender()
         target_pages = []
 
-        if self.view_mode == 'all':
-            selection_rect = self.single_view.getSelectionRect()
-            if not selection_rect:
-                QMessageBox.warning(self, "Warning", "Please make a selection first.")
-                return
+        if self.preview_page_num is not None:
+            target_pages = [self.preview_page_num]
+        elif sender == self.single_view:
             target_pages = range(len(self.pdf_doc))
-        else:
-            odd_rect = self.odd_view.getSelectionRect()
-            even_rect = self.even_view.getSelectionRect()
-            
-            if not (odd_rect or even_rect):
-                QMessageBox.warning(self, "Warning", "Please make at least one selection.")
-                return
-            
-            if odd_rect:
-                target_pages.extend(range(0, len(self.pdf_doc), 2))
-            if even_rect:
-                target_pages.extend(range(1, len(self.pdf_doc), 2))
+        elif sender == self.odd_view:
+            target_pages = range(0, len(self.pdf_doc), 2)
+        elif sender == self.even_view:
+            target_pages = range(1, len(self.pdf_doc), 2)
+        
+        if not target_pages:
+            return
 
+        self.applyWhiteout(rect, target_pages)
+
+    def applyWhiteout(self, rect, target_pages):
         # Prepare for translation
         valid_images = [img for img in self.images if img]
         if not valid_images:
@@ -812,7 +839,6 @@ class PDFViewer(QMainWindow):
         # We need page dims for each page
         all_page_dims = [(img.width(), img.height()) if img else (0,0) for img in self.images]
 
-        # Apply whiteout
         try:
             self.setUIProcessing(True)
             self.pushUndo() # Save state before modification
@@ -820,30 +846,33 @@ class PDFViewer(QMainWindow):
             for page_num in target_pages:
                 page = self.pdf_doc[page_num]
                 
-                # Determine which rect to use
-                rect_to_use = None
-                if self.view_mode == 'all':
-                    rect_to_use = selection_rect
-                else:
-                    if page_num % 2 == 0: # Odd page (0-indexed)
-                        rect_to_use = self.odd_view.getSelectionRect()
-                    else:
-                        rect_to_use = self.even_view.getSelectionRect()
+                visual_rect = None
                 
-                if not rect_to_use:
-                    continue
-
-                # Translate to visual PDF coordinates
-                visual_rect = _translate_rect_to_pdf_coords(
-                    rect_to_use,
-                    all_page_dims[page_num],
-                    page.rect,
-                    page_num,
-                    self.view_mode,
-                    max_dims,
-                    max_dims, # max_odd_dims
-                    max_dims  # max_even_dims
-                )
+                # If in single page preview, the rect is relative to that page's image (0,0)
+                if self.preview_page_num is not None:
+                    page_dims = all_page_dims[page_num]
+                    ref_rect = page.rect
+                    scale_factor_x = ref_rect.width / page_dims[0] if page_dims[0] > 0 else 0
+                    scale_factor_y = ref_rect.height / page_dims[1] if page_dims[1] > 0 else 0
+                    
+                    crop_x0 = rect.x() * scale_factor_x + ref_rect.x0
+                    crop_y0 = rect.y() * scale_factor_y + ref_rect.y0
+                    crop_x1 = crop_x0 + (rect.width() * scale_factor_x)
+                    crop_y1 = crop_y0 + (rect.height() * scale_factor_y)
+                    
+                    visual_rect = fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
+                else:
+                    # Translate to visual PDF coordinates using overlay logic
+                    visual_rect = _translate_rect_to_pdf_coords(
+                        rect,
+                        all_page_dims[page_num],
+                        page.rect,
+                        page_num,
+                        self.view_mode,
+                        max_dims,
+                        max_dims, # max_odd_dims
+                        max_dims  # max_even_dims
+                    )
                 
                 # Transform to physical coordinates for drawing
                 pdf_rect = visual_rect * page.derotation_matrix
@@ -935,6 +964,13 @@ class PDFViewer(QMainWindow):
         self.pick_color_btn.setDisabled(is_processing)
         self.delete_btn.setDisabled(is_processing)
         self.undo_btn.setDisabled(is_processing or not self.undo_stack)
+        
+        # If processing finished, restore button states based on logic
+        if not is_processing:
+            if self.whiteout_btn.isChecked():
+                self.crop_btn.setEnabled(False)
+                self.delete_btn.setEnabled(False)
+        
         if is_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         else:
