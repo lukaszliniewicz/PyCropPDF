@@ -4,14 +4,14 @@ import traceback
 
 import fitz
 from PyQt6.QtCore import QRectF, QSize, Qt, QThreadPool
-from PyQt6.QtGui import QAction, QActionGroup, QImage, QPainter, QPixmap
+from PyQt6.QtGui import QAction, QActionGroup, QImage, QPainter, QPixmap, QColor
 from PyQt6.QtWidgets import (QApplication, QFileDialog, QGridLayout,
                              QHBoxLayout, QMainWindow, QMessageBox,
                              QPushButton, QScrollArea, QToolBar, QVBoxLayout,
                              QWidget)
 
 from .widgets import PageGraphicsView, ThumbnailWidget
-from .workers import RenderAllPagesWorker, SaveWorker
+from .workers import RenderAllPagesWorker, SaveWorker, _translate_rect_to_pdf_coords
 
 
 class PDFViewer(QMainWindow):
@@ -30,8 +30,11 @@ class PDFViewer(QMainWindow):
         self.pages_rendered = 0
         self.preview_page_num = None
         self.show_crop_success_msg = False
+        self.show_whiteout_success_msg = False
         self.active_crop_info = None
         self._is_syncing_selection = False
+        self.undo_stack = []
+        self.whiteout_color = (1, 1, 1) # Default white
         
         self.single_view_pixmap_cache = None
         self.odd_view_pixmap_cache = None
@@ -48,6 +51,10 @@ class PDFViewer(QMainWindow):
         self.odd_view.selectionChanged.connect(self.sync_selection_to_even)
         self.even_view.selectionChanged.connect(self.sync_selection_to_odd)
         
+        self.single_view.colorPicked.connect(self.onColorPicked)
+        self.odd_view.colorPicked.connect(self.onColorPicked)
+        self.even_view.colorPicked.connect(self.onColorPicked)
+
         self.initUI()
         self.showMaximized()
 
@@ -194,11 +201,34 @@ class PDFViewer(QMainWindow):
 
         toolbar.addSeparator()
 
+        # Add White Out button
+        self.whiteout_btn = QPushButton('White Out Selection')
+        self.whiteout_btn.setMinimumWidth(120)
+        self.whiteout_btn.clicked.connect(self.whiteoutSelection)
+        toolbar.addWidget(self.whiteout_btn)
+
+        # Add Color Picker button
+        self.pick_color_btn = QPushButton('Pick Color')
+        self.pick_color_btn.setMinimumWidth(80)
+        self.pick_color_btn.clicked.connect(self.pickColor)
+        toolbar.addWidget(self.pick_color_btn)
+
+        toolbar.addSeparator()
+
         # Add existing delete button
         self.delete_btn = QPushButton('Delete Selected Pages')
         self.delete_btn.setMinimumWidth(150)
         self.delete_btn.clicked.connect(self.deleteSelectedPages)
         toolbar.addWidget(self.delete_btn)
+
+        toolbar.addSeparator()
+
+        # Add Undo button
+        self.undo_btn = QPushButton('Undo')
+        self.undo_btn.setMinimumWidth(80)
+        self.undo_btn.clicked.connect(self.undo)
+        self.undo_btn.setEnabled(False)
+        toolbar.addWidget(self.undo_btn)
 
         main_layout.addWidget(toolbar)
 
@@ -248,6 +278,42 @@ class PDFViewer(QMainWindow):
         self.active_crop_info = None
         self.reloadImages()
         QMessageBox.information(self, "Success", "Crop has been reset.")
+
+    def pickColor(self):
+        self.current_view.setMode('pick_color')
+        QMessageBox.information(self, "Pick Color", "Click on the page to select a color for whiteout.")
+
+    def onColorPicked(self, color):
+        self.whiteout_color = (color.redF(), color.greenF(), color.blueF())
+        QMessageBox.information(self, "Color Picked", f"Whiteout color set to RGB({int(color.red())}, {int(color.green())}, {int(color.blue())})")
+
+    def pushUndo(self):
+        if self.pdf_doc:
+            self.undo_stack.append(self.pdf_doc.tobytes())
+            if len(self.undo_stack) > 10: # Limit stack size
+                self.undo_stack.pop(0)
+            self.undo_btn.setEnabled(True)
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        
+        try:
+            self.setUIProcessing(True)
+            pdf_bytes = self.undo_stack.pop()
+            if not self.undo_stack:
+                self.undo_btn.setEnabled(False)
+            
+            if self.pdf_doc:
+                self.pdf_doc.close()
+            
+            self.pdf_doc = fitz.open("pdf", pdf_bytes)
+            self.active_crop_info = None # Reset crop on undo to avoid sync issues
+            self.reloadImages()
+            QMessageBox.information(self, "Success", "Undo successful.")
+        except Exception as e:
+            self.setUIProcessing(False)
+            QMessageBox.critical(self, "Error", f"Failed to undo: {str(e)}")
 
     def sync_selection_from_single(self, rect):
         if self._is_syncing_selection:
@@ -387,6 +453,8 @@ class PDFViewer(QMainWindow):
             self.pdf_doc = fitz.open(pdf_path)
             self.active_crop_info = None
             self.preview_page_num = None
+            self.undo_stack = []
+            self.undo_btn.setEnabled(False)
             
             for view in [self.single_view, self.odd_view, self.even_view]:
                 view.clearScene()
@@ -628,24 +696,14 @@ class PDFViewer(QMainWindow):
     def dragEnterEvent(self, event):
         try:
             mime_data = event.mimeData()
-            
-            # Print debug info
-            print("Drag enter event detected")
-            print(f"Has URLs: {mime_data.hasUrls()}")
-            if mime_data.hasUrls():
-                print(f"URLs: {[url.toString() for url in mime_data.urls()]}")
-            
             if mime_data.hasUrls():
                 for url in mime_data.urls():
                     file_path = url.toLocalFile()
-                    print(f"File path: {file_path}")
                     if file_path.lower().endswith('.pdf'):
-                        print("Accepting PDF file")
                         event.accept()
                         return
             event.ignore()
-        except Exception as e:
-            print(f"Error in dragEnterEvent: {str(e)}")
+        except Exception:
             event.ignore()
 
     def dragMoveEvent(self, event):
@@ -657,30 +715,23 @@ class PDFViewer(QMainWindow):
                         event.accept()
                         return
             event.ignore()
-        except Exception as e:
-            print(f"Error in dragMoveEvent: {str(e)}")
+        except Exception:
             event.ignore()
 
     def dropEvent(self, event):
         try:
             mime_data = event.mimeData()
-            print("Drop event detected")
-            
             if mime_data.hasUrls():
                 for url in mime_data.urls():
                     file_path = url.toLocalFile()
-                    print(f"Dropped file: {file_path}")
-                    
                     if file_path.lower().endswith('.pdf'):
-                        print(f"Loading PDF: {file_path}")
                         self.original_pdf_path = file_path
                         self.pdf_path = file_path
                         self.loadPDF(file_path)
                         event.accept()
                         return
             event.ignore()
-        except Exception as e:
-            print(f"Error in dropEvent: {str(e)}")
+        except Exception:
             event.ignore()
 
     def cropSelection(self):
@@ -717,6 +768,96 @@ class PDFViewer(QMainWindow):
         self.show_crop_success_msg = True
         self.reloadImages()
 
+    def whiteoutSelection(self):
+        if self.is_processing or not self.pdf_doc:
+            return
+
+        if self.active_crop_info:
+            QMessageBox.warning(self, "Warning", "Cannot apply whiteout while a crop is active. Please Reset Crop first.")
+            return
+
+        # Get selection
+        selection_rect = None
+        target_pages = []
+
+        if self.view_mode == 'all':
+            selection_rect = self.single_view.getSelectionRect()
+            if not selection_rect:
+                QMessageBox.warning(self, "Warning", "Please make a selection first.")
+                return
+            target_pages = range(len(self.pdf_doc))
+        else:
+            odd_rect = self.odd_view.getSelectionRect()
+            even_rect = self.even_view.getSelectionRect()
+            
+            if not (odd_rect or even_rect):
+                QMessageBox.warning(self, "Warning", "Please make at least one selection.")
+                return
+            
+            if odd_rect:
+                target_pages.extend(range(0, len(self.pdf_doc), 2))
+            if even_rect:
+                target_pages.extend(range(1, len(self.pdf_doc), 2))
+
+        # Prepare for translation
+        valid_images = [img for img in self.images if img]
+        if not valid_images:
+            return
+            
+        max_width = max(img.width() for img in valid_images)
+        max_height = max(img.height() for img in valid_images)
+        
+        max_dims = (max_width, max_height)
+        
+        # We need page dims for each page
+        all_page_dims = [(img.width(), img.height()) if img else (0,0) for img in self.images]
+
+        # Apply whiteout
+        try:
+            self.setUIProcessing(True)
+            self.pushUndo() # Save state before modification
+
+            for page_num in target_pages:
+                page = self.pdf_doc[page_num]
+                
+                # Determine which rect to use
+                rect_to_use = None
+                if self.view_mode == 'all':
+                    rect_to_use = selection_rect
+                else:
+                    if page_num % 2 == 0: # Odd page (0-indexed)
+                        rect_to_use = self.odd_view.getSelectionRect()
+                    else:
+                        rect_to_use = self.even_view.getSelectionRect()
+                
+                if not rect_to_use:
+                    continue
+
+                # Translate to visual PDF coordinates
+                visual_rect = _translate_rect_to_pdf_coords(
+                    rect_to_use,
+                    all_page_dims[page_num],
+                    page.rect,
+                    page_num,
+                    self.view_mode,
+                    max_dims,
+                    max_dims, # max_odd_dims
+                    max_dims  # max_even_dims
+                )
+                
+                # Transform to physical coordinates for drawing
+                pdf_rect = visual_rect * page.derotation_matrix
+                
+                # Draw rectangle with selected color
+                page.draw_rect(pdf_rect, color=self.whiteout_color, fill=self.whiteout_color, width=0)
+
+            self.show_whiteout_success_msg = True
+            self.reloadImages()
+            
+        except Exception as e:
+            self.setUIProcessing(False)
+            QMessageBox.critical(self, "Error", f"Failed to apply whiteout: {str(e)}")
+
     def deleteSelectedPages(self):
         if not self.pdf_doc:
             QMessageBox.warning(self, "Warning", "No PDF is open.")
@@ -728,6 +869,7 @@ class PDFViewer(QMainWindow):
             return
 
         try:
+            self.pushUndo() # Save state before modification
             self.invalidate_pixmap_cache()
 
             # Remap crop rectangles if a crop is active
@@ -789,7 +931,10 @@ class PDFViewer(QMainWindow):
         self.menuBar().setEnabled(not is_processing)
         self.crop_btn.setDisabled(is_processing)
         self.reset_crop_btn.setDisabled(is_processing)
+        self.whiteout_btn.setDisabled(is_processing)
+        self.pick_color_btn.setDisabled(is_processing)
         self.delete_btn.setDisabled(is_processing)
+        self.undo_btn.setDisabled(is_processing or not self.undo_stack)
         if is_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         else:
@@ -808,6 +953,9 @@ class PDFViewer(QMainWindow):
         if self.show_crop_success_msg:
             self.show_crop_success_msg = False
             QMessageBox.information(self, "Success", "PDF cropped successfully!")
+        elif self.show_whiteout_success_msg:
+            self.show_whiteout_success_msg = False
+            QMessageBox.information(self, "Success", "Whiteout applied successfully!")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -1,11 +1,12 @@
 from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QCursor, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (QCheckBox, QGraphicsScene, QGraphicsView, QLabel,
                              QVBoxLayout, QWidget)
 
 
 class PageGraphicsView(QGraphicsView):
     selectionChanged = pyqtSignal(QRectF)
+    colorPicked = pyqtSignal(QColor)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -19,7 +20,7 @@ class PageGraphicsView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setMouseTracking(True)
         
-        self._mode = 'none'  # 'none', 'draw', 'move', 'resize'
+        self._mode = 'none'  # 'none', 'draw', 'move', 'resize', 'pick_color'
         self._resize_handle = None
         self._start_pos = None
         self._original_rect = None
@@ -29,6 +30,13 @@ class PageGraphicsView(QGraphicsView):
         self._pan = False
         self._last_pan_pos = QPointF()
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+
+    def setMode(self, mode):
+        self._mode = mode
+        if mode == 'pick_color':
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
@@ -74,6 +82,23 @@ class PageGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._mode == 'pick_color':
+                pos = self.mapToScene(event.pos())
+                items = self.scene.items(pos)
+                for item in items:
+                    if hasattr(item, 'pixmap'):
+                        # Map scene pos to item pos
+                        item_pos = item.mapFromScene(pos)
+                        pixmap = item.pixmap()
+                        x = int(item_pos.x())
+                        y = int(item_pos.y())
+                        if 0 <= x < pixmap.width() and 0 <= y < pixmap.height():
+                            color = pixmap.toImage().pixelColor(x, y)
+                            self.colorPicked.emit(color)
+                            self.setMode('none')
+                            return
+                return
+
             if self._pan:
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self._last_pan_pos = event.pos()
@@ -98,6 +123,9 @@ class PageGraphicsView(QGraphicsView):
 
 
     def mouseMoveEvent(self, event):
+        if self._mode == 'pick_color':
+            return
+
         if self._pan:
             if event.buttons() & Qt.MouseButton.LeftButton:
                 delta = event.pos() - self._last_pan_pos

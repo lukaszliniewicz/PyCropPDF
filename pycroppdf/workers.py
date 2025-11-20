@@ -17,9 +17,9 @@ class WorkerSignals(QObject):
     result = pyqtSignal(object)
 
 
-def _translate_rect_to_pdf_coords(scene_rect, page_dims, page_media_box, page_num, 
+def _translate_rect_to_pdf_coords(scene_rect, page_dims, pdf_page_rect, page_num, 
                                   view_mode, max_dims, max_odd_dims, max_even_dims):
-    """Translates a QRectF from scene coordinates to a fitz.Rect in PDF coordinates."""
+    """Translates a QRectF from scene coordinates to a fitz.Rect in PDF coordinates (visual)."""
     page_width, page_height = page_dims
     
     if view_mode == 'all':
@@ -35,19 +35,20 @@ def _translate_rect_to_pdf_coords(scene_rect, page_dims, page_media_box, page_nu
     x_offset = (max_width - page_width) // 2
     y_offset = (max_height - page_height) // 2
     
-    media_box = page_media_box
-    scale_factor_x = media_box.width / page_width if page_width > 0 else 0
-    scale_factor_y = media_box.height / page_height if page_height > 0 else 0
+    # Use the provided pdf_page_rect (usually page.rect) which matches the visual orientation
+    ref_rect = pdf_page_rect
+    scale_factor_x = ref_rect.width / page_width if page_width > 0 else 0
+    scale_factor_y = ref_rect.height / page_height if page_height > 0 else 0
 
-    crop_x0 = (scene_rect.x() - x_offset) * scale_factor_x + media_box.x0
-    crop_y0 = (scene_rect.y() - y_offset) * scale_factor_y + media_box.y0
+    crop_x0 = (scene_rect.x() - x_offset) * scale_factor_x + ref_rect.x0
+    crop_y0 = (scene_rect.y() - y_offset) * scale_factor_y + ref_rect.y0
     crop_x1 = crop_x0 + (scene_rect.width() * scale_factor_x)
     crop_y1 = crop_y0 + (scene_rect.height() * scale_factor_y)
 
-    crop_x0 = max(media_box.x0, min(crop_x0, media_box.x1))
-    crop_y0 = max(media_box.y0, min(crop_y0, media_box.y1))
-    crop_x1 = max(media_box.x0, min(crop_x1, media_box.x1))
-    crop_y1 = max(media_box.y0, min(crop_y1, media_box.y1))
+    crop_x0 = max(ref_rect.x0, min(crop_x0, ref_rect.x1))
+    crop_y0 = max(ref_rect.y0, min(crop_y0, ref_rect.y1))
+    crop_x1 = max(ref_rect.x0, min(crop_x1, ref_rect.x1))
+    crop_y1 = max(ref_rect.y0, min(crop_y1, ref_rect.y1))
     return fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
 
 
@@ -61,16 +62,18 @@ def _render_page_task(args):
     if crop_args:
         scene_rect = crop_args.get('rect')
         if scene_rect:
-            clip_rect = _translate_rect_to_pdf_coords(
+            visual_rect = _translate_rect_to_pdf_coords(
                 scene_rect,
                 crop_args['page_dims'],
-                page.mediabox,
+                page.rect,
                 page_num,
                 crop_args['view_mode'],
                 crop_args['max_dims'],
                 crop_args['max_odd_dims'],
                 crop_args['max_even_dims']
             )
+            # Transform visual rect to physical coordinates for clip
+            clip_rect = visual_rect * page.derotation_matrix
 
     pix = page.get_pixmap(matrix=zoom_matrix, clip=clip_rect)
     # Return picklable data, not QImage
@@ -176,10 +179,12 @@ class SaveWorker(QRunnable):
                         scene_rect = crop_rects[page_num]
                         page_dims = all_page_dims[page_num]
                         
-                        crop_rect = _translate_rect_to_pdf_coords(
-                            scene_rect, page_dims, page.mediabox, page_num, view_mode,
+                        visual_rect = _translate_rect_to_pdf_coords(
+                            scene_rect, page_dims, page.rect, page_num, view_mode,
                             max_dims, max_odd_dims, max_even_dims
                         )
+                        # Transform visual rect to physical coordinates
+                        crop_rect = visual_rect * page.derotation_matrix
                         page.set_cropbox(crop_rect)
             
             doc.save(self.save_path, garbage=2, deflate=self.deflate)
