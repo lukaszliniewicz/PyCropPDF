@@ -15,7 +15,7 @@ from .workers import RenderAllPagesWorker, SaveWorker, _translate_rect_to_pdf_co
 
 
 class PDFViewer(QMainWindow):
-    def __init__(self, input_pdf=None, save_directory=None, save_filename=None):
+    def __init__(self, input_pdf=None, save_directory=None, save_filename=None, manifest_path=None):
         super().__init__()
         self.images = []
         self.setAcceptDrops(True)
@@ -25,6 +25,7 @@ class PDFViewer(QMainWindow):
         self.view_mode = 'odd_even'
         self.save_directory = save_directory
         self.save_filename = save_filename
+        self.manifest_path = manifest_path
         self.threadpool = QThreadPool()
         self.is_processing = False
         self.pages_rendered = 0
@@ -34,6 +35,9 @@ class PDFViewer(QMainWindow):
         self.active_crop_info = None
         self._is_syncing_selection = False
         self.undo_stack = []
+        self.page_map = []
+        self.original_page_count = 0
+        self.whiteout_operations = []
         self.whiteout_color = (1, 1, 1) # Default white
         
         self.single_view_pixmap_cache = None
@@ -321,7 +325,13 @@ class PDFViewer(QMainWindow):
 
     def pushUndo(self):
         if self.pdf_doc:
-            self.undo_stack.append(self.pdf_doc.tobytes())
+            self.undo_stack.append(
+                {
+                    "pdf_bytes": self.pdf_doc.tobytes(),
+                    "page_map": list(self.page_map),
+                    "whiteouts": list(self.whiteout_operations),
+                }
+            )
             if len(self.undo_stack) > 10: # Limit stack size
                 self.undo_stack.pop(0)
             self.undo_btn.setEnabled(True)
@@ -332,14 +342,16 @@ class PDFViewer(QMainWindow):
         
         try:
             self.setUIProcessing(True)
-            pdf_bytes = self.undo_stack.pop()
+            snapshot = self.undo_stack.pop()
             if not self.undo_stack:
                 self.undo_btn.setEnabled(False)
             
             if self.pdf_doc:
                 self.pdf_doc.close()
             
-            self.pdf_doc = fitz.open("pdf", pdf_bytes)
+            self.pdf_doc = fitz.open("pdf", snapshot["pdf_bytes"])
+            self.page_map = list(snapshot["page_map"])
+            self.whiteout_operations = list(snapshot["whiteouts"])
             self.active_crop_info = None # Reset crop on undo to avoid sync issues
             self.reloadImages()
             QMessageBox.information(self, "Success", "Undo successful.")
@@ -483,9 +495,13 @@ class PDFViewer(QMainWindow):
                 self.original_pdf_path = pdf_path
 
             self.pdf_doc = fitz.open(pdf_path)
+            self.pdf_path = pdf_path
             self.active_crop_info = None
             self.preview_page_num = None
             self.undo_stack = []
+            self.page_map = list(range(len(self.pdf_doc)))
+            self.original_page_count = len(self.pdf_doc)
+            self.whiteout_operations = []
             self.undo_btn.setEnabled(False)
             
             for view in [self.single_view, self.odd_view, self.even_view]:
@@ -879,6 +895,15 @@ class PDFViewer(QMainWindow):
                 
                 # Draw rectangle with selected color
                 page.draw_rect(pdf_rect, color=self.whiteout_color, fill=self.whiteout_color, width=0)
+                original_page = self.page_map[page_num] if page_num < len(self.page_map) else page_num
+                self.whiteout_operations.append(
+                    {
+                        "output_page": page_num + 1,
+                        "original_page": original_page + 1,
+                        "rect": [round(float(value), 3) for value in pdf_rect],
+                        "color": [round(float(value), 4) for value in self.whiteout_color],
+                    }
+                )
 
             self.show_whiteout_success_msg = True
             self.reloadImages()
@@ -919,6 +944,7 @@ class PDFViewer(QMainWindow):
             for page_num in selected_pages:
                 self.pdf_doc.delete_page(page_num)
                 self.images.pop(page_num)
+                self.page_map.pop(page_num)
                 if self.active_crop_info and self.active_crop_info.get('image_dims'):
                     self.active_crop_info['image_dims'].pop(page_num)
 
@@ -949,7 +975,18 @@ class PDFViewer(QMainWindow):
         self.setUIProcessing(True)
         deflate_enabled = not self.fast_save_action.isChecked()
         pdf_bytes = self.pdf_doc.tobytes()
-        worker = SaveWorker(pdf_bytes, save_path, self.active_crop_info, deflate=deflate_enabled)
+        manifest_path = self.manifest_path or f"{save_path}.pycroppdf.json"
+        worker = SaveWorker(
+            pdf_bytes,
+            save_path,
+            self.active_crop_info,
+            deflate=deflate_enabled,
+            source_path=self.original_pdf_path or self.pdf_path,
+            manifest_path=manifest_path,
+            page_map=self.page_map,
+            original_page_count=self.original_page_count,
+            whiteouts=self.whiteout_operations,
+        )
         worker.signals.result.connect(self.saveFinished)
         worker.signals.error.connect(self.processingError)
         worker.signals.finished.connect(self.processingFinished)

@@ -7,6 +7,8 @@ import fitz
 from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
 from PyQt6.QtGui import QImage
 
+from .provenance import build_manifest, sha256_file, write_manifest
+
 
 class WorkerSignals(QObject):
     """
@@ -143,18 +145,40 @@ class SaveWorker(QRunnable):
     """
     Worker thread for saving PDF.
     """
-    def __init__(self, pdf_bytes, save_path, crop_info=None, deflate=False):
+    def __init__(
+        self,
+        pdf_bytes,
+        save_path,
+        crop_info=None,
+        deflate=False,
+        source_path=None,
+        manifest_path=None,
+        page_map=None,
+        original_page_count=None,
+        whiteouts=None,
+    ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.save_path = save_path
         self.crop_info = crop_info
         self.deflate = deflate
+        self.source_path = source_path
+        self.manifest_path = manifest_path
+        self.page_map = list(page_map or [])
+        self.original_page_count = original_page_count
+        self.whiteouts = list(whiteouts or [])
 
     def run(self):
         try:
+            source_sha256 = (
+                sha256_file(self.source_path)
+                if self.manifest_path and self.source_path and os.path.isfile(self.source_path)
+                else None
+            )
             doc = fitz.open("pdf", self.pdf_bytes)
 
+            applied_crops = []
             # If crop is active, apply it to each page
             if self.crop_info:
                 all_page_dims = self.crop_info['image_dims']
@@ -186,9 +210,41 @@ class SaveWorker(QRunnable):
                         # Transform visual rect to physical coordinates
                         crop_rect = visual_rect * page.derotation_matrix
                         page.set_cropbox(crop_rect)
+                        original_page = self.page_map[page_num] if page_num < len(self.page_map) else page_num
+                        applied_crops.append(
+                            {
+                                "output_page": page_num + 1,
+                                "original_page": original_page + 1,
+                                "rect": [round(float(value), 3) for value in crop_rect],
+                            }
+                        )
             
             doc.save(self.save_path, garbage=2, deflate=self.deflate)
             doc.close()
+            if self.manifest_path and self.source_path and os.path.isfile(self.source_path):
+                resolved_page_map = self.page_map or list(range(int(self.original_page_count or 0)))
+                output_page_by_original = {
+                    original_page: output_page + 1
+                    for output_page, original_page in enumerate(resolved_page_map)
+                }
+                resolved_whiteouts = []
+                for whiteout in self.whiteouts:
+                    original_page = int(whiteout.get("original_page") or 0)
+                    if original_page - 1 not in output_page_by_original:
+                        continue
+                    resolved = dict(whiteout)
+                    resolved["output_page"] = output_page_by_original[original_page - 1]
+                    resolved_whiteouts.append(resolved)
+                manifest = build_manifest(
+                    self.source_path,
+                    self.save_path,
+                    resolved_page_map,
+                    int(self.original_page_count or len(resolved_page_map)),
+                    crops=applied_crops,
+                    whiteouts=resolved_whiteouts,
+                    source_sha256=source_sha256,
+                )
+                write_manifest(self.manifest_path, manifest)
             self.signals.result.emit(True)
 
         except Exception:

@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--input', type=str, help='Path to input PDF file')
     parser.add_argument('--save-to', type=str, help='Directory to save modified PDF')
     parser.add_argument('--save-as', type=str, help='Filename for the saved modified PDF')
+    parser.add_argument('--manifest-out', type=str, help='Write a JSON provenance manifest when the PDF is saved')
     
     args = parser.parse_args()
 
@@ -29,6 +30,11 @@ def main():
         sys.exit(1)
 
     app = QApplication(sys.argv)
-    viewer = PDFViewer(input_pdf=args.input, save_directory=args.save_to, save_filename=args.save_as)
+    viewer = PDFViewer(
+        input_pdf=args.input,
+        save_directory=args.save_to,
+        save_filename=args.save_as,
+        manifest_path=args.manifest_out,
+    )
     viewer.show()
     sys.exit(app.exec())

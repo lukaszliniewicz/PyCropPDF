@@ -58,8 +58,11 @@ The application supports command-line arguments that can be useful in scripts or
 -   `--input /path/to/file.pdf`: Opens a PDF on startup.
 -   `--save-to /path/to/directory/`: Sets the directory for saving the modified PDF.
 -   `--save-as filename.pdf`: Sets the filename for the saved PDF.
+-   `--manifest-out /path/to/output.json`: Sets the provenance sidecar path.
 
 When `--save-to` or `--save-as` are used, the "Save" dialog is skipped, and the file is saved directly to the specified location after the user clicks "Save PDF..." in the File menu.
+
+Every saved PDF also receives a provenance sidecar by default. It records source and output hashes, deleted pages, original-to-output page mapping, crop rectangles, and whiteout rectangles so downstream applications can retain an auditable relationship to the original PDF.
 
 A `pycroppdf.py` script is included for backward compatibility with existing programmatic usage; it is a simple wrapper for `run.py`.
 
