@@ -4,12 +4,15 @@ import traceback
 
 import fitz
 from PyQt6.QtCore import QRectF, QSize, Qt, QThreadPool
-from PyQt6.QtGui import QAction, QActionGroup, QImage, QPainter, QPixmap, QColor
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QGridLayout,
-                             QHBoxLayout, QMainWindow, QMessageBox,
-                             QPushButton, QScrollArea, QToolBar, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtGui import (QAction, QActionGroup, QColor, QImage, QKeySequence,
+                         QPainter, QPixmap)
+from PyQt6.QtWidgets import (QApplication, QButtonGroup, QFileDialog,
+                             QGridLayout, QHBoxLayout, QLabel, QMainWindow,
+                             QMessageBox, QPushButton, QScrollArea,
+                             QSizePolicy, QToolBar, QVBoxLayout, QWidget)
 
+from .state import (clone_crop_info, remap_crop_info_after_deletions,
+                    remap_page_indices_after_deletions)
 from .widgets import PageGraphicsView, ThumbnailWidget
 from .workers import RenderAllPagesWorker, SaveWorker, _translate_rect_to_pdf_coords
 
@@ -30,15 +33,17 @@ class PDFViewer(QMainWindow):
         self.is_processing = False
         self.pages_rendered = 0
         self.preview_page_num = None
-        self.show_crop_success_msg = False
-        self.show_whiteout_success_msg = False
+        self.pending_status_message = ""
         self.active_crop_info = None
+        self.active_tool = 'crop'
         self._is_syncing_selection = False
         self.undo_stack = []
         self.page_map = []
         self.original_page_count = 0
         self.whiteout_operations = []
         self.whiteout_color = (1, 1, 1) # Default white
+        self.selected_pages = set()
+        self.selection_anchor = None
         
         self.single_view_pixmap_cache = None
         self.odd_view_pixmap_cache = None
@@ -120,6 +125,27 @@ class PDFViewer(QMainWindow):
                 color: #888888;
                 border-color: #555555;
             }
+            QPushButton:checked {
+                background-color: #5d4f7f;
+                border-color: #9575cd;
+            }
+            QPushButton#saveButton {
+                background-color: #7e57c2;
+                color: white;
+                border-color: #9575cd;
+                font-weight: bold;
+            }
+            QPushButton#saveButton:hover {
+                background-color: #9575cd;
+            }
+            QPushButton#saveButton:pressed {
+                background-color: #5e35b1;
+            }
+            QPushButton#saveButton:disabled {
+                background-color: #444444;
+                color: #888888;
+                border-color: #555555;
+            }
             QToolBar::separator {
                 background-color: #555555;
                 width: 1px;
@@ -147,6 +173,7 @@ class PDFViewer(QMainWindow):
         file_menu.addAction(open_action)
 
         save_action = QAction('&Save PDF...', self)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.savePDF)
         file_menu.addAction(save_action)
         file_menu.addSeparator()
@@ -156,6 +183,12 @@ class PDFViewer(QMainWindow):
         self.fast_save_action.setChecked(True)
         self.fast_save_action.setToolTip("Disable compression for faster saving. May result in a larger file size.")
         file_menu.addAction(self.fast_save_action)
+
+        edit_menu = menu_bar.addMenu('&Edit')
+        self.undo_action = QAction('&Undo', self)
+        self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self.undo_action.triggered.connect(self.undo)
+        edit_menu.addAction(self.undo_action)
 
         # View menu
         view_menu = menu_bar.addMenu('&View')
@@ -193,15 +226,38 @@ class PDFViewer(QMainWindow):
         toolbar.setFloatable(False)
 
 
-        # Add Crop Selection button
-        self.crop_btn = QPushButton('Crop Selection')
+        toolbar.addWidget(QLabel("Tool:"))
+
+        self.tool_button_group = QButtonGroup(self)
+        self.tool_button_group.setExclusive(True)
+
+        self.crop_tool_btn = QPushButton('Crop Box')
+        self.crop_tool_btn.setCheckable(True)
+        self.crop_tool_btn.setChecked(True)
+        self.crop_tool_btn.setToolTip("Draw or adjust the crop box.")
+        self.crop_tool_btn.clicked.connect(lambda: self.setActiveTool('crop'))
+        self.tool_button_group.addButton(self.crop_tool_btn)
+        toolbar.addWidget(self.crop_tool_btn)
+
+        self.whiteout_btn = QPushButton('Whiteout')
+        self.whiteout_btn.setCheckable(True)
+        self.whiteout_btn.setToolTip("Draw a filled rectangle over unwanted content.")
+        self.whiteout_btn.clicked.connect(lambda: self.setActiveTool('whiteout'))
+        self.tool_button_group.addButton(self.whiteout_btn)
+        toolbar.addWidget(self.whiteout_btn)
+
+        self.pick_color_btn = QPushButton('Whiteout Color')
+        self.pick_color_btn.setMinimumWidth(100)
+        self.pick_color_btn.clicked.connect(self.pickColor)
+        toolbar.addWidget(self.pick_color_btn)
+
+        toolbar.addSeparator()
+
+        self.crop_btn = QPushButton('Apply Crop')
         self.crop_btn.setMinimumWidth(100)
         self.crop_btn.clicked.connect(self.cropSelection)
         toolbar.addWidget(self.crop_btn)
 
-        toolbar.addSeparator()
-
-        # Add Reset Crop button
         self.reset_crop_btn = QPushButton('Reset Crop')
         self.reset_crop_btn.setMinimumWidth(100)
         self.reset_crop_btn.clicked.connect(self.resetCrop)
@@ -209,22 +265,6 @@ class PDFViewer(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Add White Out button
-        self.whiteout_btn = QPushButton('White Out')
-        self.whiteout_btn.setCheckable(True)
-        self.whiteout_btn.setMinimumWidth(80)
-        self.whiteout_btn.clicked.connect(self.toggleWhiteoutTool)
-        toolbar.addWidget(self.whiteout_btn)
-
-        # Add Color Picker button
-        self.pick_color_btn = QPushButton('Pick Color')
-        self.pick_color_btn.setMinimumWidth(80)
-        self.pick_color_btn.clicked.connect(self.pickColor)
-        toolbar.addWidget(self.pick_color_btn)
-
-        toolbar.addSeparator()
-
-        # Add existing delete button
         self.delete_btn = QPushButton('Delete Selected Pages')
         self.delete_btn.setMinimumWidth(150)
         self.delete_btn.clicked.connect(self.deleteSelectedPages)
@@ -238,6 +278,16 @@ class PDFViewer(QMainWindow):
         self.undo_btn.clicked.connect(self.undo)
         self.undo_btn.setEnabled(False)
         toolbar.addWidget(self.undo_btn)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
+
+        self.save_btn = QPushButton('Save PDF')
+        self.save_btn.setObjectName('saveButton')
+        self.save_btn.setMinimumWidth(110)
+        self.save_btn.clicked.connect(self.savePDF)
+        toolbar.addWidget(self.save_btn)
 
         main_layout.addWidget(toolbar)
 
@@ -273,6 +323,11 @@ class PDFViewer(QMainWindow):
         
         content_layout.addWidget(self.view_stack)
         main_layout.addWidget(content_widget)
+        self.statusBar().showMessage(
+            "Crop Box tool selected. Draw a box, then click Apply Crop.",
+            6000,
+        )
+        self.updateActionState()
 
     def invalidate_pixmap_cache(self):
         self.single_view_pixmap_cache = None
@@ -283,78 +338,91 @@ class PDFViewer(QMainWindow):
         if not self.active_crop_info:
             QMessageBox.information(self, "Info", "No crop is currently active.")
             return
-        
-        self.active_crop_info = None
-        self.reloadImages()
-        QMessageBox.information(self, "Success", "Crop has been reset.")
 
-    def toggleWhiteoutTool(self):
-        is_active = self.whiteout_btn.isChecked()
-        tool = 'whiteout' if is_active else 'select'
-        
-        self.single_view.setTool(tool)
-        self.odd_view.setTool(tool)
-        self.even_view.setTool(tool)
-        
-        if is_active:
-            self.crop_btn.setEnabled(False)
-            self.delete_btn.setEnabled(False)
+        self.pushUndo(include_pdf=False)
+        self.active_crop_info = None
+        self.pending_status_message = "Crop reset."
+        self.reloadImages()
+
+    def setActiveTool(self, tool):
+        if tool == 'whiteout' and self.active_crop_info:
+            QMessageBox.warning(
+                self,
+                "Reset Crop First",
+                "Whiteout cannot be positioned reliably on an active cropped preview. "
+                "Reset the crop, apply whiteout, then crop again.",
+            )
+            tool = 'crop'
+
+        self.active_tool = tool if tool in {'crop', 'whiteout'} else 'crop'
+        self.crop_tool_btn.setChecked(self.active_tool == 'crop')
+        self.whiteout_btn.setChecked(self.active_tool == 'whiteout')
+        view_tool = 'whiteout' if self.active_tool == 'whiteout' else 'select'
+        for view in [self.single_view, self.odd_view, self.even_view]:
+            view.setTool(view_tool)
+
+        if self.active_tool == 'whiteout':
+            self.statusBar().showMessage(
+                "Whiteout tool selected. Drag over unwanted content. Selected pages take priority.",
+                6000,
+            )
         else:
-            self.crop_btn.setEnabled(True)
-            self.delete_btn.setEnabled(True)
+            self.statusBar().showMessage(
+                "Crop Box tool selected. Draw a box, then click Apply Crop.",
+                6000,
+            )
+        self.updateActionState()
 
     def pickColor(self):
-        # Deactivate whiteout tool if active
-        if self.whiteout_btn.isChecked():
-            self.whiteout_btn.setChecked(False)
-            self.toggleWhiteoutTool()
-
-        self.single_view.setTool('pick_color')
-        self.odd_view.setTool('pick_color')
-        self.even_view.setTool('pick_color')
-        
-        QMessageBox.information(self, "Pick Color", "Click on the page to select a color for whiteout.")
+        for view in [self.single_view, self.odd_view, self.even_view]:
+            view.setTool('pick_color')
+        self.statusBar().showMessage("Click a page pixel to choose the whiteout color.", 6000)
 
     def onColorPicked(self, color):
         self.whiteout_color = (color.redF(), color.greenF(), color.blueF())
-        QMessageBox.information(self, "Color Picked", f"Whiteout color set to RGB({int(color.red())}, {int(color.green())}, {int(color.blue())})")
-        # Restore select tool
-        self.single_view.setTool('select')
-        self.odd_view.setTool('select')
-        self.even_view.setTool('select')
+        self.statusBar().showMessage(
+            f"Whiteout color set to RGB({int(color.red())}, {int(color.green())}, {int(color.blue())}).",
+            6000,
+        )
+        self.setActiveTool('whiteout' if not self.active_crop_info else 'crop')
 
-    def pushUndo(self):
+    def pushUndo(self, include_pdf=True):
         if self.pdf_doc:
             self.undo_stack.append(
                 {
-                    "pdf_bytes": self.pdf_doc.tobytes(),
+                    "pdf_bytes": self.pdf_doc.tobytes() if include_pdf else None,
                     "page_map": list(self.page_map),
-                    "whiteouts": list(self.whiteout_operations),
+                    "whiteouts": [dict(operation) for operation in self.whiteout_operations],
+                    "active_crop_info": clone_crop_info(self.active_crop_info),
+                    "selected_pages": set(self.selected_pages),
+                    "selection_anchor": self.selection_anchor,
+                    "preview_page_num": self.preview_page_num,
                 }
             )
             if len(self.undo_stack) > 10: # Limit stack size
                 self.undo_stack.pop(0)
-            self.undo_btn.setEnabled(True)
+            self.updateActionState()
 
     def undo(self):
         if not self.undo_stack:
             return
         
         try:
-            self.setUIProcessing(True)
+            self.statusBar().showMessage("Restoring previous document state...")
             snapshot = self.undo_stack.pop()
-            if not self.undo_stack:
-                self.undo_btn.setEnabled(False)
-            
-            if self.pdf_doc:
-                self.pdf_doc.close()
-            
-            self.pdf_doc = fitz.open("pdf", snapshot["pdf_bytes"])
+
+            if snapshot.get("pdf_bytes") is not None:
+                if self.pdf_doc:
+                    self.pdf_doc.close()
+                self.pdf_doc = fitz.open("pdf", snapshot["pdf_bytes"])
             self.page_map = list(snapshot["page_map"])
             self.whiteout_operations = list(snapshot["whiteouts"])
-            self.active_crop_info = None # Reset crop on undo to avoid sync issues
+            self.active_crop_info = clone_crop_info(snapshot.get("active_crop_info"))
+            self.selected_pages = set(snapshot.get("selected_pages", set()))
+            self.selection_anchor = snapshot.get("selection_anchor")
+            self.preview_page_num = snapshot.get("preview_page_num")
+            self.pending_status_message = "Undo complete."
             self.reloadImages()
-            QMessageBox.information(self, "Success", "Undo successful.")
         except Exception as e:
             self.setUIProcessing(False)
             QMessageBox.critical(self, "Error", f"Failed to undo: {str(e)}")
@@ -426,11 +494,13 @@ class PDFViewer(QMainWindow):
         help_text = """<b>Basic Usage:</b>
 <ol>
 <li>Open a PDF using <b>File > Open PDF...</b> or by dragging it into the window.</li>
-<li>Select a crop area by clicking and dragging on the page view(s).</li>
-<li>Click <b>Crop Selection</b> to apply the crop. You can reset it with <b>Reset Crop</b>.</li>
-<li>Use the checkboxes next to the thumbnails to select pages for deletion, then click <b>Delete Selected Pages</b>.</li>
+<li>Choose <b>Crop Box</b> or <b>Whiteout</b> in the toolbar, then drag on the page view.</li>
+<li>Click <b>Apply Crop</b> to preview a crop. You can restore it with <b>Reset Crop</b>.</li>
+<li>Click a thumbnail to select one page. Use <b>Ctrl</b> to toggle pages and <b>Shift</b> to select a range.</li>
+<li>Selected pages limit crop and whiteout operations and can be removed with <b>Delete Selected Pages</b>.</li>
 <li>Use the <b>View</b> menu to switch between a single overlay of all pages or separate overlays for odd and even pages.</li>
-<li>Save your changes with <b>File > Save PDF...</b>.</li>
+<li>Use <b>Undo</b> to restore the previous crop, whiteout, or page deletion.</li>
+<li>Save your changes with the purple <b>Save PDF</b> button.</li>
 </ol>"""
         QMessageBox.information(self, "About PyCropPDF", help_text)
 
@@ -498,18 +568,21 @@ class PDFViewer(QMainWindow):
             self.pdf_path = pdf_path
             self.active_crop_info = None
             self.preview_page_num = None
+            self.pending_status_message = ""
             self.undo_stack = []
             self.page_map = list(range(len(self.pdf_doc)))
             self.original_page_count = len(self.pdf_doc)
             self.whiteout_operations = []
-            self.undo_btn.setEnabled(False)
+            self.selected_pages = set()
+            self.selection_anchor = None
             
             for view in [self.single_view, self.odd_view, self.even_view]:
                 view.clearScene()
                 view.selecting = False
                 view.selection_start = None
                 view.selection_rect = None
-                
+
+            self.setActiveTool('crop')
             self.reloadImages()
 
         except Exception as e:
@@ -532,6 +605,7 @@ class PDFViewer(QMainWindow):
 
         self.images = [None] * num_pages
         self.pages_rendered = 0
+        self.statusBar().showMessage(f"Rendering page previews: 0/{num_pages}...")
         
         pdf_bytes = self.pdf_doc.tobytes()
         worker = RenderAllPagesWorker(pdf_bytes, num_pages, self.active_crop_info)
@@ -544,6 +618,9 @@ class PDFViewer(QMainWindow):
         page_num, image = result
         self.images[page_num] = image
         self.pages_rendered += 1
+        self.statusBar().showMessage(
+            f"Rendering page previews: {self.pages_rendered}/{len(self.pdf_doc)}..."
+        )
         
         if self.pages_rendered == len(self.pdf_doc):
             self.updateThumbnails()
@@ -726,6 +803,9 @@ class PDFViewer(QMainWindow):
             col = i % 2
             thumbnail = ThumbnailWidget(i, image)
             thumbnail.previewRequested.connect(self.togglePagePreview)
+            thumbnail.selectionRequested.connect(self.handleThumbnailSelection)
+            thumbnail.setSelectedForDeletion(i in self.selected_pages)
+            thumbnail.setSelectedForPreview(i == self.preview_page_num)
             self.thumbnail_layout.addWidget(thumbnail, row, col)
 
         # Add a stretch to the bottom to align thumbnails to the top
@@ -734,12 +814,52 @@ class PDFViewer(QMainWindow):
             self.thumbnail_layout.setRowStretch(num_rows, 1)
 
     def getSelectedPages(self):
-        selected = []
+        return sorted(self.selected_pages)
+
+    def _thumbnail_widgets(self):
         for i in range(self.thumbnail_layout.count()):
             widget = self.thumbnail_layout.itemAt(i).widget()
-            if isinstance(widget, ThumbnailWidget) and widget.checkbox.isChecked():
-                selected.append(widget.page_num)
-        return selected
+            if isinstance(widget, ThumbnailWidget):
+                yield widget
+
+    def _sync_thumbnail_selection(self):
+        for widget in self._thumbnail_widgets():
+            widget.setSelectedForDeletion(widget.page_num in self.selected_pages)
+            widget.setSelectedForPreview(widget.page_num == self.preview_page_num)
+
+    def handleThumbnailSelection(self, page_num, modifiers):
+        if self.is_processing:
+            return
+
+        page_num = int(page_num)
+        modifiers = modifiers or Qt.KeyboardModifier.NoModifier
+        control = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+
+        if shift and self.selection_anchor is not None:
+            start, end = sorted((self.selection_anchor, page_num))
+            range_selection = set(range(start, end + 1))
+            if control:
+                self.selected_pages.update(range_selection)
+            else:
+                self.selected_pages = range_selection
+        elif control:
+            if page_num in self.selected_pages:
+                self.selected_pages.remove(page_num)
+            else:
+                self.selected_pages.add(page_num)
+            self.selection_anchor = page_num
+        else:
+            self.selected_pages = {page_num}
+            self.selection_anchor = page_num
+
+        self._sync_thumbnail_selection()
+        count = len(self.selected_pages)
+        self.statusBar().showMessage(
+            f"{count} page{'s' if count != 1 else ''} selected. "
+            "Use Ctrl to toggle pages or Shift to select a range.",
+            6000,
+        )
     
     def dragEnterEvent(self, event):
         try:
@@ -787,33 +907,60 @@ class PDFViewer(QMainWindow):
             return
 
         crop_rects = {}
-        if self.view_mode == 'all':
+        selected_targets = set(self.getSelectedPages())
+        if self.preview_page_num is not None:
             scene_rect = self.single_view.getSelectionRect()
             if not scene_rect:
-                QMessageBox.warning(self, "Warning", "Please make a selection first.")
+                QMessageBox.warning(self, "Warning", "Please draw a crop box first.")
                 return
-            for page_num in range(len(self.pdf_doc)):
-                crop_rects[page_num] = scene_rect
+            target_pages = selected_targets or {self.preview_page_num}
+            for page_num in target_pages:
+                crop_rects[page_num] = QRectF(scene_rect)
+        elif self.view_mode == 'all':
+            scene_rect = self.single_view.getSelectionRect()
+            if not scene_rect:
+                QMessageBox.warning(self, "Warning", "Please draw a crop box first.")
+                return
+            target_pages = selected_targets or set(range(len(self.pdf_doc)))
+            for page_num in target_pages:
+                crop_rects[page_num] = QRectF(scene_rect)
         else:
             odd_rect = self.odd_view.getSelectionRect()
             even_rect = self.even_view.getSelectionRect()
             if not (odd_rect or even_rect):
-                QMessageBox.warning(self, "Warning", "Please make at least one selection.")
+                QMessageBox.warning(self, "Warning", "Please draw at least one crop box.")
                 return
             if odd_rect:
                 for i in range(0, len(self.pdf_doc), 2):
-                    crop_rects[i] = odd_rect
+                    if not selected_targets or i in selected_targets:
+                        crop_rects[i] = QRectF(odd_rect)
             if even_rect:
                 for i in range(1, len(self.pdf_doc), 2):
-                    crop_rects[i] = even_rect
-        
+                    if not selected_targets or i in selected_targets:
+                        crop_rects[i] = QRectF(even_rect)
+
+        if not crop_rects:
+            QMessageBox.warning(
+                self,
+                "Warning",
+                "The selected pages do not have a crop box for their odd/even group.",
+            )
+            return
+
+        self.pushUndo(include_pdf=False)
         self.active_crop_info = {
             'rects': crop_rects,
             'view_mode': self.view_mode,
-            'image_dims': [(img.width(), img.height()) for img in self.images if img]
+            'image_dims': [
+                (img.width(), img.height()) if img else (0, 0)
+                for img in self.images
+            ],
         }
-        
-        self.show_crop_success_msg = True
+
+        self.pending_status_message = (
+            f"Crop preview applied to {len(crop_rects)} page"
+            f"{'s' if len(crop_rects) != 1 else ''}."
+        )
         self.reloadImages()
 
     def handleWhiteoutRequest(self, rect):
@@ -825,16 +972,18 @@ class PDFViewer(QMainWindow):
             return
 
         sender = self.sender()
-        target_pages = []
+        target_pages = self.getSelectedPages()
 
-        if self.preview_page_num is not None:
+        if target_pages:
+            pass
+        elif self.preview_page_num is not None:
             target_pages = [self.preview_page_num]
         elif sender == self.single_view:
-            target_pages = range(len(self.pdf_doc))
+            target_pages = list(range(len(self.pdf_doc)))
         elif sender == self.odd_view:
-            target_pages = range(0, len(self.pdf_doc), 2)
+            target_pages = list(range(0, len(self.pdf_doc), 2))
         elif sender == self.even_view:
-            target_pages = range(1, len(self.pdf_doc), 2)
+            target_pages = list(range(1, len(self.pdf_doc), 2))
         
         if not target_pages:
             return
@@ -856,7 +1005,10 @@ class PDFViewer(QMainWindow):
         all_page_dims = [(img.width(), img.height()) if img else (0,0) for img in self.images]
 
         try:
-            self.setUIProcessing(True)
+            self.statusBar().showMessage(
+                f"Applying whiteout to {len(target_pages)} page"
+                f"{'s' if len(target_pages) != 1 else ''}..."
+            )
             self.pushUndo() # Save state before modification
 
             for page_num in target_pages:
@@ -905,7 +1057,10 @@ class PDFViewer(QMainWindow):
                     }
                 )
 
-            self.show_whiteout_success_msg = True
+            self.pending_status_message = (
+                f"Whiteout applied to {len(target_pages)} page"
+                f"{'s' if len(target_pages) != 1 else ''}."
+            )
             self.reloadImages()
             
         except Exception as e:
@@ -926,30 +1081,33 @@ class PDFViewer(QMainWindow):
             self.pushUndo() # Save state before modification
             self.invalidate_pixmap_cache()
 
-            # Remap crop rectangles if a crop is active
-            if self.active_crop_info and 'rects' in self.active_crop_info:
-                new_crop_rects = {}
-                current_page_index = 0
-                original_rects = self.active_crop_info['rects']
-                # Use non-reversed list for set for efficiency
-                deleted_set = set(self.getSelectedPages())
-
-                for i in range(len(self.pdf_doc)):
-                    if i not in deleted_set:
-                        if i in original_rects:
-                            new_crop_rects[current_page_index] = original_rects[i]
-                        current_page_index += 1
-                self.active_crop_info['rects'] = new_crop_rects
+            deleted_set = set(selected_pages)
+            self.active_crop_info = remap_crop_info_after_deletions(
+                self.active_crop_info,
+                deleted_set,
+            )
+            if self.preview_page_num is not None:
+                remapped_preview = remap_page_indices_after_deletions(
+                    {self.preview_page_num},
+                    deleted_set,
+                )
+                self.preview_page_num = next(iter(remapped_preview), None)
 
             for page_num in selected_pages:
                 self.pdf_doc.delete_page(page_num)
                 self.images.pop(page_num)
                 self.page_map.pop(page_num)
-                if self.active_crop_info and self.active_crop_info.get('image_dims'):
-                    self.active_crop_info['image_dims'].pop(page_num)
 
+            self.selected_pages = set()
+            self.selection_anchor = None
             self.updateThumbnails()
             self.updateOverlay()
+            self.updateActionState()
+            self.statusBar().showMessage(
+                f"Deleted {len(selected_pages)} page"
+                f"{'s' if len(selected_pages) != 1 else ''}.",
+                6000,
+            )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to delete pages: {str(e)}")
 
@@ -973,6 +1131,7 @@ class PDFViewer(QMainWindow):
             return
 
         self.setUIProcessing(True)
+        self.statusBar().showMessage("Saving PDF and provenance manifest...")
         deflate_enabled = not self.fast_save_action.isChecked()
         pdf_bytes = self.pdf_doc.tobytes()
         manifest_path = self.manifest_path or f"{save_path}.pycroppdf.json"
@@ -992,43 +1151,45 @@ class PDFViewer(QMainWindow):
         worker.signals.finished.connect(self.processingFinished)
         self.threadpool.start(worker)
 
+    def updateActionState(self):
+        has_document = self.pdf_doc is not None
+        available = has_document and not self.is_processing
+        self.crop_tool_btn.setEnabled(available)
+        self.whiteout_btn.setEnabled(available and not self.active_crop_info)
+        self.crop_btn.setEnabled(available and self.active_tool == 'crop')
+        self.reset_crop_btn.setEnabled(available and bool(self.active_crop_info))
+        self.pick_color_btn.setEnabled(available)
+        self.delete_btn.setEnabled(available)
+        self.undo_btn.setEnabled(available and bool(self.undo_stack))
+        self.undo_action.setEnabled(available and bool(self.undo_stack))
+        self.save_btn.setEnabled(available)
+
     def setUIProcessing(self, is_processing):
+        was_processing = self.is_processing
         self.is_processing = is_processing
         self.menuBar().setEnabled(not is_processing)
-        self.crop_btn.setDisabled(is_processing)
-        self.reset_crop_btn.setDisabled(is_processing)
-        self.whiteout_btn.setDisabled(is_processing)
-        self.pick_color_btn.setDisabled(is_processing)
-        self.delete_btn.setDisabled(is_processing)
-        self.undo_btn.setDisabled(is_processing or not self.undo_stack)
-        
-        # If processing finished, restore button states based on logic
-        if not is_processing:
-            if self.whiteout_btn.isChecked():
-                self.crop_btn.setEnabled(False)
-                self.delete_btn.setEnabled(False)
-        
-        if is_processing:
+        self.updateActionState()
+
+        if is_processing and not was_processing:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        else:
+        elif not is_processing and was_processing:
             QApplication.restoreOverrideCursor()
 
     def saveFinished(self, success):
         if success:
-            QMessageBox.information(self, "Success", "PDF saved successfully!")
+            self.statusBar().showMessage("PDF and provenance manifest saved successfully.", 8000)
 
     def processingError(self, error_str):
+        self.pending_status_message = ""
+        self.statusBar().showMessage("The operation failed.", 8000)
         QMessageBox.critical(self, "Error", f"An error occurred:\n{error_str}")
         print(error_str)
 
     def processingFinished(self):
         self.setUIProcessing(False)
-        if self.show_crop_success_msg:
-            self.show_crop_success_msg = False
-            QMessageBox.information(self, "Success", "PDF cropped successfully!")
-        elif self.show_whiteout_success_msg:
-            self.show_whiteout_success_msg = False
-            QMessageBox.information(self, "Success", "Whiteout applied successfully!")
+        if self.pending_status_message:
+            self.statusBar().showMessage(self.pending_status_message, 8000)
+            self.pending_status_message = ""
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

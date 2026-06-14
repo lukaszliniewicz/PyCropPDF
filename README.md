@@ -10,7 +10,9 @@ A GUI application to crop PDF files. It is primarily designed for documents wher
 -   **Visual Cropping:** Draw a crop box directly on a preview of your PDF.
 -   **Overlay Previews:** All pages are overlaid with transparency, making it easy to define a crop area that fits all pages.
 -   **Odd/Even Page Modes:** View and crop odd and even pages separately, useful for books or two-sided documents with different layouts.
--   **Page Deletion:** Select and remove unwanted pages.
+-   **Crop and Whiteout Tools:** Explicitly choose whether dragging creates a crop box or applies a whiteout.
+-   **Page Selection:** Select one page, toggle pages with Ctrl, or select ranges with Shift.
+-   **Page Deletion and Undo:** Remove unwanted pages and undo crop, whiteout, or deletion operations.
 -   **Cross-Platform:** Built with Python and PyQt6, it runs on Windows, macOS, and Linux.
 
 ## Installation
@@ -71,10 +73,10 @@ A `pycroppdf.py` script is included for backward compatibility with existing pro
 1.  Launch the application.
 2.  Open a PDF file using **File > Open PDF...** or by dragging and dropping the file onto the window.
 3.  The pages will be displayed as an overlay. Use the **View** menu to switch between a single overlay for all pages or separate overlays for odd and even pages.
-4.  Click and drag on a page preview to draw a crop box. Adjust the box by dragging its edges or corners.
-5.  Click the **Crop Selection** button to apply the crop. A preview of the cropped pages will be shown.
-6.  Use the checkboxes next to the page thumbnails to select pages for deletion, then click **Delete Selected Pages**.
-7.  Save the modified PDF using **File > Save PDF...**.
+4.  Choose the **Crop Box** or **Whiteout** tool, then click and drag on a page preview.
+5.  Click **Apply Crop** to preview the crop. Use **Reset Crop** or **Undo** to restore it.
+6.  Click a thumbnail to select one page, Ctrl-click to toggle pages, or Shift-click to select a range. Selected pages limit crop and whiteout operations and can be removed with **Delete Selected Pages**.
+7.  Save the modified PDF with the purple **Save PDF** button or **File > Save PDF...**.
 
 ## License
 

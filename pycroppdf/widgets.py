@@ -1,7 +1,7 @@
 from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import (QCheckBox, QGraphicsScene, QGraphicsView, QLabel,
-                             QVBoxLayout, QWidget)
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QGraphicsScene,
+                             QGraphicsView, QLabel, QVBoxLayout, QWidget)
 
 
 class PageGraphicsView(QGraphicsView):
@@ -162,7 +162,8 @@ class PageGraphicsView(QGraphicsView):
         elif self._mode == 'draw':
             rect = QRectF(self._start_pos, pos).normalized()
             if not self.selection_item:
-                pen = QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.SolidLine)
+                color = QColor("#ef5350") if self._tool == 'whiteout' else QColor("#7e57c2")
+                pen = QPen(color, 2, Qt.PenStyle.SolidLine)
                 self.selection_item = self.scene.addRect(rect, pen)
             else:
                 self.selection_item.setRect(rect)
@@ -223,7 +224,7 @@ class PageGraphicsView(QGraphicsView):
             return
 
         if not self.selection_item:
-            pen = QPen(Qt.GlobalColor.blue, 2, Qt.PenStyle.SolidLine)
+            pen = QPen(QColor("#7e57c2"), 2, Qt.PenStyle.SolidLine)
             self.selection_item = self.scene.addRect(rect, pen)
         else:
             self.selection_item.setRect(rect)
@@ -244,6 +245,7 @@ class PageGraphicsView(QGraphicsView):
 
 class ThumbnailWidget(QWidget):
     previewRequested = pyqtSignal(int)
+    selectionRequested = pyqtSignal(int, object)
 
     def __init__(self, page_num, image, parent=None):
         super().__init__(parent)
@@ -252,6 +254,9 @@ class ThumbnailWidget(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         self.checkbox = QCheckBox()
         self.page_num = page_num
+        self._selected_for_deletion = False
+        self._selected_for_preview = False
+        self.checkbox.clicked.connect(self._request_selection)
         
         # Create thumbnail
         self.label = QLabel()
@@ -274,12 +279,38 @@ class ThumbnailWidget(QWidget):
 
     def eventFilter(self, source, event):
         if source == self.label and event.type() == QEvent.Type.MouseButtonPress:
-            self.previewRequested.emit(self.page_num)
+            modifiers = event.modifiers()
+            self.selectionRequested.emit(self.page_num, modifiers)
+            range_modifiers = (
+                Qt.KeyboardModifier.ControlModifier
+                | Qt.KeyboardModifier.ShiftModifier
+            )
+            if not modifiers & range_modifiers:
+                self.previewRequested.emit(self.page_num)
             return True
         return super().eventFilter(source, event)
 
-    def setSelectedForPreview(self, selected):
-        if selected:
-            self.label.setStyleSheet("border: 2px solid darkviolet;")
+    def _request_selection(self):
+        self.selectionRequested.emit(self.page_num, QApplication.keyboardModifiers())
+
+    def _refresh_highlight(self):
+        if self._selected_for_preview:
+            self.label.setStyleSheet("border: 2px solid #7e57c2;")
+        elif self._selected_for_deletion:
+            self.label.setStyleSheet("border: 2px dashed #9575cd;")
         else:
             self.label.setStyleSheet("border: 2px solid transparent;")
+
+        if self._selected_for_deletion:
+            self.setStyleSheet("background-color: #3a3446; border-radius: 4px;")
+        else:
+            self.setStyleSheet("background-color: transparent;")
+
+    def setSelectedForDeletion(self, selected):
+        self._selected_for_deletion = bool(selected)
+        self.checkbox.setChecked(self._selected_for_deletion)
+        self._refresh_highlight()
+
+    def setSelectedForPreview(self, selected):
+        self._selected_for_preview = bool(selected)
+        self._refresh_highlight()
