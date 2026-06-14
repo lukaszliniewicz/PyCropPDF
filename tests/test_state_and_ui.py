@@ -101,10 +101,16 @@ class ViewerInteractionTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        self.show_maximized_patch = patch("pycroppdf.main_window.PDFViewer.showMaximized")
+        self.show_maximized_patch.start()
         self.viewer = PDFViewer()
 
     def tearDown(self):
+        self.viewer.threadpool.waitForDone()
         self.viewer.close()
+        self.viewer.deleteLater()
+        self.app.processEvents()
+        self.show_maximized_patch.stop()
 
     def _wait_for_processing(self, timeout=20):
         deadline = time.time() + timeout

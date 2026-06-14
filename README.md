@@ -1,83 +1,110 @@
-
 # PyCropPDF
 
-A GUI application to crop PDF files. It is primarily designed for documents where multiple pages need the same cropping, such as removing headers, footers, or margins.
+PyCropPDF is a desktop application designed to crop and mask PDF files. It is particularly suited for documents where multiple pages share a common layout structure—such as scanned books, academic papers, or reports—allowing you to remove margins, headers, footers, or watermarks across many pages simultaneously.
 
-![python_Kk7XZgDZLZ](https://github.com/user-attachments/assets/f626c86e-8799-4f54-98e0-4342649fac64)
+![PyCropPDF Screenshot](https://github.com/user-attachments/assets/f626c86e-8799-4f54-98e0-4342649fac64)
 
-## Features
+## Key Concepts
 
--   **Visual Cropping:** Draw a crop box directly on a preview of your PDF.
--   **Overlay Previews:** All pages are overlaid with transparency, making it easy to define a crop area that fits all pages.
--   **Odd/Even Page Modes:** View and crop odd and even pages separately, useful for books or two-sided documents with different layouts.
--   **Crop and Whiteout Tools:** Explicitly choose whether dragging creates a crop box or applies a whiteout.
--   **Page Selection:** Select one page, toggle pages with Ctrl, or select ranges with Shift.
--   **Page Deletion and Undo:** Remove unwanted pages and undo crop, whiteout, or deletion operations.
--   **Cross-Platform:** Built with Python and PyQt6, it runs on Windows, macOS, and Linux.
+### 1. Transparent Overlay Preview
+Instead of showing pages one-by-one, PyCropPDF renders and overlays page previews transparently on top of each other. This enables you to visually check that a selected crop boundary or whiteout mask fits every page in the document (or group of pages) without clipping text or diagrams.
+
+### 2. View Modes
+- **All Pages (Overlay)**: Overlays all document pages together. Helpful for verifying margins across the entire document.
+- **Odd / Even Pages**: Splits the preview into two separate overlays—one for odd pages and one for even pages. This is useful for double-sided documents (like bound books) where the left and right margins alternate.
+- **Single Page Preview**: Focuses on a single page, allowing you to fine-tune boundaries for specific layout exceptions.
+
+### 3. Crop vs. Whiteout Tools
+- **Crop Box**: Defines a bounding box. When applied, pages are cropped to this box (modifying the PDF page's physical boundaries).
+- **Whiteout Mask**: Applies solid rectangular overlays (masks) to cover page content. You can choose a custom color to match the page background.
+
+### 4. Page Selection & Deletion
+A sidebar displays thumbnails of all pages. 
+- Multi-selection is supported using `Ctrl + Click` (toggle individual pages) and `Shift + Click` (select a range of pages).
+- Operations (cropping and whiteout) can be limited to the selected pages.
+- Selected pages can be deleted from the document.
+- Operations can be undone step-by-step.
+
+### 5. Provenance Manifests
+When you save a modified PDF, the application generates a JSON sidecar manifest (e.g., `document_modified.pdf.pycroppdf.json`). This manifest records:
+- SHA-256 hashes of the source and output PDF files.
+- Original page counts and mapping of output pages to original pages.
+- Explicit lists of deleted page indices.
+- Exact coordinates and dimensions of crops and whiteouts applied.
+
+This manifest enables downstream automated pipelines to trace the history and modifications of the edited PDF back to its original source.
+
+---
 
 ## Installation
 
-### From PyPI (Recommended)
-The easiest way to install PyCropPDF is from PyPI:
+### Prerequisites
+- Python 3.8 or higher.
+
+### Installation from PyPI
+You can install PyCropPDF directly using pip:
 ```bash
 pip install pycroppdf
 ```
 
-### From GitHub
-You can also install the latest development version directly from GitHub. Ensure you have Python 3.8+ and git installed.
-```bash
-pip install git+https://github.com/lukaszliniewicz/PyCropPDF.git
-```
-This command will handle downloading and installing the package and its dependencies.
-
-### Development / Editable Install
-If you plan to modify the code, clone the repository and install it in "editable" mode:
+### Installation from Source (Development Mode)
+To clone the repository and install it in editable mode for development:
 ```bash
 git clone https://github.com/lukaszliniewicz/PyCropPDF.git
 cd PyCropPDF
 pip install -e .
 ```
-This will install the package in editable mode and handle all dependencies.
+
+---
 
 ## Usage
 
-After installation, you can run the application from your terminal:
-
+Start the graphical interface from the terminal:
 ```bash
 pycroppdf
 ```
 
-You can also provide a PDF file to open on startup:
-
+To start the interface with a PDF already loaded:
 ```bash
-pycroppdf --input /path/to/your/document.pdf
+pycroppdf --input /path/to/document.pdf
 ```
 
-### Programmatic Use & Command-Line Arguments
+### Command-Line Arguments & Automation
+The application accepts arguments to pre-configure paths and manifest outputs:
+- `--input /path/to/file.pdf`: Loads the specified PDF at launch.
+- `--save-to /path/to/directory/`: Specifies the folder where the edited PDF will be saved.
+- `--save-as filename.pdf`: Specifies the filename for the output PDF.
+- `--manifest-out /path/to/output.json`: Overrides the default location for the JSON provenance manifest.
 
-The application supports command-line arguments that can be useful in scripts or automated workflows that still require manual user input (e.g., for selecting crop boxes).
+*Note: If `--save-to` or `--save-as` is specified, the standard "Save File" dialog is bypassed. Clicking "Save PDF..." immediately saves the file to the pre-configured path.*
 
--   `--input /path/to/file.pdf`: Opens a PDF on startup.
--   `--save-to /path/to/directory/`: Sets the directory for saving the modified PDF.
--   `--save-as filename.pdf`: Sets the filename for the saved PDF.
--   `--manifest-out /path/to/output.json`: Sets the provenance sidecar path.
+### Basic Edit Workflow
+1. **Open a PDF**: Drag and drop a PDF file into the window, or go to **File > Open PDF...**.
+2. **Select View Mode**: Choose **All**, **Odd/Even**, or double-click a page thumbnail to view a single page.
+3. **Apply a Crop**: Select the **Crop Box** tool, click and drag a box on the canvas, and click **Apply Crop**. If odd/even mode is active, you can define separate boxes for odd and even pages.
+4. **Apply a Whiteout**: Select the **Whiteout** tool, click and drag to cover text/images.
+5. **Manage Pages**: Select thumbnails in the sidebar to delete unnecessary pages.
+6. **Undo Changes**: Use the **Undo** button or `Ctrl + Z` to revert your actions.
+7. **Save**: Click **Save PDF** to export the modified document and its provenance manifest.
 
-When `--save-to` or `--save-as` are used, the "Save" dialog is skipped, and the file is saved directly to the specified location after the user clicks "Save PDF..." in the File menu.
+---
 
-Every saved PDF also receives a provenance sidecar by default. It records source and output hashes, deleted pages, original-to-output page mapping, crop rectangles, and whiteout rectangles so downstream applications can retain an auditable relationship to the original PDF.
+## Development & Building
 
-A `pycroppdf.py` script is included for backward compatibility with existing programmatic usage; it is a simple wrapper for `run.py`.
+### Running Unit Tests
+Install `pytest` and execute it from the project root:
+```bash
+pytest
+```
 
-### Basic Workflow
+### Building a Standalone Executable
+You can compile PyCropPDF into a standalone executable using `pyinstaller`. From your environment, run:
+```bash
+pyinstaller --onefile --noconsole --name PyCropPDF run.py
+```
+This produces a single, self-contained executable file inside the `dist/` directory.
 
-1.  Launch the application.
-2.  Open a PDF file using **File > Open PDF...** or by dragging and dropping the file onto the window.
-3.  The pages will be displayed as an overlay. Use the **View** menu to switch between a single overlay for all pages or separate overlays for odd and even pages.
-4.  Choose the **Crop Box** or **Whiteout** tool, then click and drag on a page preview.
-5.  Click **Apply Crop** to preview the crop. Use **Reset Crop** or **Undo** to restore it.
-6.  Click a thumbnail to select one page, Ctrl-click to toggle pages, or Shift-click to select a range. Selected pages limit crop and whiteout operations and can be removed with **Delete Selected Pages**.
-7.  Save the modified PDF with the purple **Save PDF** button or **File > Save PDF...**.
+---
 
 ## License
-
 This project is licensed under the MIT License. See the `LICENSE` file for details.
