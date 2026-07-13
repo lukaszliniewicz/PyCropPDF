@@ -11,12 +11,14 @@ from .main_window import PDFViewer
 def main():
     multiprocessing.freeze_support()
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='PDF Overlay Viewer')
-    parser.add_argument('--input', type=str, help='Path to input PDF file')
-    parser.add_argument('--save-to', type=str, help='Directory to save modified PDF')
-    parser.add_argument('--save-as', type=str, help='Filename for the saved modified PDF')
-    parser.add_argument('--manifest-out', type=str, help='Write a JSON provenance manifest when the PDF is saved')
-    
+    parser = argparse.ArgumentParser(description="PyCropPDF: crop, mask, and redact PDFs")
+    parser.add_argument("--input", type=str, help="Path to input PDF file")
+    parser.add_argument("--save-to", type=str, help="Directory to save modified PDF")
+    parser.add_argument("--save-as", type=str, help="Filename for the saved modified PDF")
+    parser.add_argument(
+        "--manifest-out", type=str, help="Write a JSON provenance manifest when the PDF is saved"
+    )
+
     args = parser.parse_args()
 
     # Validate save directory if provided

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def sha256_file(path: str) -> str:
@@ -20,6 +20,11 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    """Return the SHA-256 digest for an in-memory source snapshot."""
+    return hashlib.sha256(data).hexdigest()
+
+
 def build_manifest(
     source_path: str,
     output_path: str,
@@ -27,7 +32,9 @@ def build_manifest(
     original_page_count: int,
     crops: list[dict[str, Any]] | None = None,
     whiteouts: list[dict[str, Any]] | None = None,
+    redactions: list[dict[str, Any]] | None = None,
     source_sha256: str | None = None,
+    output_sha256: str | None = None,
 ) -> dict[str, Any]:
     mapped_pages = {int(page) for page in page_map}
     deleted_pages = [
@@ -44,7 +51,7 @@ def build_manifest(
         },
         "output": {
             "path": os.path.abspath(output_path),
-            "sha256": sha256_file(output_path),
+            "sha256": output_sha256 or sha256_file(output_path),
             "page_count": len(page_map),
         },
         "page_map": [
@@ -54,6 +61,7 @@ def build_manifest(
         "deleted_original_pages": deleted_pages,
         "crops": list(crops or []),
         "whiteouts": list(whiteouts or []),
+        "redactions": list(redactions or []),
     }
 
 

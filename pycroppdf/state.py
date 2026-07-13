@@ -8,18 +8,19 @@ from PyQt6.QtCore import QRectF
 
 
 def clone_crop_info(crop_info: dict | None) -> dict | None:
-    """Return an independent copy of crop state, including Qt rectangles."""
+    """Return an independent copy of crop state and its rectangle values."""
     if not crop_info:
         return None
 
     cloned = dict(crop_info)
-    cloned["rects"] = {
-        int(page_num): QRectF(rect)
-        for page_num, rect in crop_info.get("rects", {}).items()
-    }
+    cloned["rects"] = {}
+    for page_num, rect in crop_info.get("rects", {}).items():
+        if isinstance(rect, QRectF):
+            cloned["rects"][int(page_num)] = QRectF(rect)
+        else:
+            cloned["rects"][int(page_num)] = tuple(float(value) for value in rect)
     cloned["image_dims"] = [
-        (int(width), int(height))
-        for width, height in crop_info.get("image_dims", [])
+        (int(width), int(height)) for width, height in crop_info.get("image_dims", [])
     ]
     return cloned
 
@@ -55,11 +56,9 @@ def remap_crop_info_after_deletions(
     original_dims = cloned.get("image_dims", [])
 
     cloned["rects"] = {
-        new_page_num: QRectF(original_rects[old_page_num])
+        new_page_num: original_rects[old_page_num]
         for new_page_num, old_page_num in enumerate(
-            page_num
-            for page_num in range(len(original_dims))
-            if page_num not in deleted_set
+            page_num for page_num in range(len(original_dims)) if page_num not in deleted_set
         )
         if old_page_num in original_rects
     }

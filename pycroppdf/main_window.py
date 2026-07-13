@@ -1,20 +1,33 @@
 import os
-import tempfile
-import traceback
 
 import fitz
-from PyQt6.QtCore import QRectF, QSize, Qt, QThreadPool
-from PyQt6.QtGui import (QAction, QActionGroup, QColor, QImage, QKeySequence,
-                         QPainter, QPixmap)
-from PyQt6.QtWidgets import (QApplication, QButtonGroup, QFileDialog,
-                             QGridLayout, QHBoxLayout, QLabel, QMainWindow,
-                             QMessageBox, QPushButton, QScrollArea,
-                             QSizePolicy, QToolBar, QVBoxLayout, QWidget)
+from PyQt6.QtCore import QRectF, Qt, QThreadPool
+from PyQt6.QtGui import QAction, QActionGroup, QImage, QKeySequence, QPainter, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
-from .state import (clone_crop_info, remap_crop_info_after_deletions,
-                    remap_page_indices_after_deletions)
+from .provenance import sha256_bytes
+from .state import (
+    clone_crop_info,
+    remap_crop_info_after_deletions,
+    remap_page_indices_after_deletions,
+)
 from .widgets import PageGraphicsView, ThumbnailWidget
-from .workers import RenderAllPagesWorker, SaveWorker, _translate_rect_to_pdf_coords
+from .workers import RenderAllPagesWorker, SaveWorker, rect_to_tuple, scene_rect_to_pdf_coords
 
 
 class PDFViewer(QMainWindow):
@@ -25,7 +38,8 @@ class PDFViewer(QMainWindow):
         self.pdf_doc = None
         self.pdf_path = None
         self.original_pdf_path = None
-        self.view_mode = 'odd_even'
+        self.source_sha256 = None
+        self.view_mode = "odd_even"
         self.save_directory = save_directory
         self.save_filename = save_filename
         self.manifest_path = manifest_path
@@ -34,32 +48,35 @@ class PDFViewer(QMainWindow):
         self.pages_rendered = 0
         self.preview_page_num = None
         self.pending_status_message = ""
+        self._operation_id = 0
+        self.is_dirty = False
         self.active_crop_info = None
-        self.active_tool = 'crop'
+        self.active_tool = "crop"
         self._is_syncing_selection = False
         self.undo_stack = []
         self.page_map = []
         self.original_page_count = 0
         self.whiteout_operations = []
-        self.whiteout_color = (1, 1, 1) # Default white
+        self.redaction_operations = []
+        self.whiteout_color = (1, 1, 1)  # Default white
         self.selected_pages = set()
         self.selection_anchor = None
-        
+
         self.single_view_pixmap_cache = None
         self.odd_view_pixmap_cache = None
         self.even_view_pixmap_cache = None
-        
+
         # Create views
         self.single_view = PageGraphicsView()
         self.odd_view = PageGraphicsView()
         self.even_view = PageGraphicsView()
-        
+
         self.current_view = self.single_view
-        
+
         self.single_view.selectionChanged.connect(self.sync_selection_from_single)
         self.odd_view.selectionChanged.connect(self.sync_selection_to_even)
         self.even_view.selectionChanged.connect(self.sync_selection_to_odd)
-        
+
         self.single_view.colorPicked.connect(self.onColorPicked)
         self.odd_view.colorPicked.connect(self.onColorPicked)
         self.even_view.colorPicked.connect(self.onColorPicked)
@@ -67,18 +84,21 @@ class PDFViewer(QMainWindow):
         self.single_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
         self.odd_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
         self.even_view.whiteoutRequested.connect(self.handleWhiteoutRequest)
+        self.single_view.redactionRequested.connect(self.handleRedactionRequest)
+        self.odd_view.redactionRequested.connect(self.handleRedactionRequest)
+        self.even_view.redactionRequested.connect(self.handleRedactionRequest)
 
         self.initUI()
         self.showMaximized()
 
         # Load PDF if provided
         if input_pdf:
-            self.loadPDF(input_pdf)
+            self.loadPDF(input_pdf, confirm_discard=False)
 
     def initUI(self):
         self.setAcceptDrops(True)
         self.setAttribute(Qt.WidgetAttribute.WA_AcceptDrops, True)
-        self.setWindowTitle('PDF Overlay Viewer')
+        self.setWindowTitle("PyCropPDF")
         self.setGeometry(100, 100, 1400, 800)
 
         self.setStyleSheet("""
@@ -167,51 +187,53 @@ class PDFViewer(QMainWindow):
         menu_bar = self.menuBar()
 
         # File menu
-        file_menu = menu_bar.addMenu('&File')
-        open_action = QAction('&Open PDF...', self)
+        file_menu = menu_bar.addMenu("&File")
+        open_action = QAction("&Open PDF...", self)
         open_action.triggered.connect(self.openPDF)
         file_menu.addAction(open_action)
 
-        save_action = QAction('&Save PDF...', self)
+        save_action = QAction("&Save PDF...", self)
         save_action.setShortcut(QKeySequence.StandardKey.Save)
         save_action.triggered.connect(self.savePDF)
         file_menu.addAction(save_action)
         file_menu.addSeparator()
 
-        self.fast_save_action = QAction('Fast Save (larger file)', self)
+        self.fast_save_action = QAction("Fast Save (larger file)", self)
         self.fast_save_action.setCheckable(True)
         self.fast_save_action.setChecked(True)
-        self.fast_save_action.setToolTip("Disable compression for faster saving. May result in a larger file size.")
+        self.fast_save_action.setToolTip(
+            "Disable compression for faster saving. May result in a larger file size."
+        )
         file_menu.addAction(self.fast_save_action)
 
-        edit_menu = menu_bar.addMenu('&Edit')
-        self.undo_action = QAction('&Undo', self)
+        edit_menu = menu_bar.addMenu("&Edit")
+        self.undo_action = QAction("&Undo", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
         self.undo_action.triggered.connect(self.undo)
         edit_menu.addAction(self.undo_action)
 
         # View menu
-        view_menu = menu_bar.addMenu('&View')
+        view_menu = menu_bar.addMenu("&View")
         self.view_mode_group = QActionGroup(self)
         self.view_mode_group.setExclusive(True)
 
-        self.odd_even_action = QAction('Separate Odd/Even Pages', self)
+        self.odd_even_action = QAction("Separate Odd/Even Pages", self)
         self.odd_even_action.setCheckable(True)
-        self.odd_even_action.setChecked(self.view_mode == 'odd_even')
-        self.odd_even_action.triggered.connect(lambda: self.setViewMode('odd_even'))
+        self.odd_even_action.setChecked(self.view_mode == "odd_even")
+        self.odd_even_action.triggered.connect(lambda: self.setViewMode("odd_even"))
         self.view_mode_group.addAction(self.odd_even_action)
         view_menu.addAction(self.odd_even_action)
 
-        self.all_pages_action = QAction('All Pages Overlay', self)
+        self.all_pages_action = QAction("All Pages Overlay", self)
         self.all_pages_action.setCheckable(True)
-        self.all_pages_action.setChecked(self.view_mode == 'all')
-        self.all_pages_action.triggered.connect(lambda: self.setViewMode('all'))
+        self.all_pages_action.setChecked(self.view_mode == "all")
+        self.all_pages_action.triggered.connect(lambda: self.setViewMode("all"))
         self.view_mode_group.addAction(self.all_pages_action)
         view_menu.addAction(self.all_pages_action)
 
         # Help menu
-        help_menu = menu_bar.addMenu('&Help')
-        about_action = QAction('&About', self)
+        help_menu = menu_bar.addMenu("&Help")
+        about_action = QAction("&About", self)
         about_action.triggered.connect(self.showHelp)
         help_menu.addAction(about_action)
 
@@ -225,47 +247,58 @@ class PDFViewer(QMainWindow):
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
 
-
         toolbar.addWidget(QLabel("Tool:"))
 
         self.tool_button_group = QButtonGroup(self)
         self.tool_button_group.setExclusive(True)
 
-        self.crop_tool_btn = QPushButton('Crop Box')
+        self.crop_tool_btn = QPushButton("Crop Box")
         self.crop_tool_btn.setCheckable(True)
         self.crop_tool_btn.setChecked(True)
         self.crop_tool_btn.setToolTip("Draw or adjust the crop box.")
-        self.crop_tool_btn.clicked.connect(lambda: self.setActiveTool('crop'))
+        self.crop_tool_btn.clicked.connect(lambda: self.setActiveTool("crop"))
         self.tool_button_group.addButton(self.crop_tool_btn)
         toolbar.addWidget(self.crop_tool_btn)
 
-        self.whiteout_btn = QPushButton('Whiteout')
+        self.whiteout_btn = QPushButton("Visual Mask")
         self.whiteout_btn.setCheckable(True)
-        self.whiteout_btn.setToolTip("Draw a filled rectangle over unwanted content.")
-        self.whiteout_btn.clicked.connect(lambda: self.setActiveTool('whiteout'))
+        self.whiteout_btn.setToolTip(
+            "Draw a visual overlay. It does not remove text or images from the PDF."
+        )
+        self.whiteout_btn.clicked.connect(lambda: self.setActiveTool("whiteout"))
         self.tool_button_group.addButton(self.whiteout_btn)
         toolbar.addWidget(self.whiteout_btn)
 
-        self.pick_color_btn = QPushButton('Whiteout Color')
+        self.redact_btn = QPushButton("Redact")
+        self.redact_btn.setCheckable(True)
+        self.redact_btn.setToolTip(
+            "Permanently remove page content in the selected rectangle. "
+            "This does not remove document metadata or attachments."
+        )
+        self.redact_btn.clicked.connect(lambda: self.setActiveTool("redact"))
+        self.tool_button_group.addButton(self.redact_btn)
+        toolbar.addWidget(self.redact_btn)
+
+        self.pick_color_btn = QPushButton("Whiteout Color")
         self.pick_color_btn.setMinimumWidth(100)
         self.pick_color_btn.clicked.connect(self.pickColor)
         toolbar.addWidget(self.pick_color_btn)
 
         toolbar.addSeparator()
 
-        self.crop_btn = QPushButton('Apply Crop')
+        self.crop_btn = QPushButton("Apply Crop")
         self.crop_btn.setMinimumWidth(100)
         self.crop_btn.clicked.connect(self.cropSelection)
         toolbar.addWidget(self.crop_btn)
 
-        self.reset_crop_btn = QPushButton('Reset Crop')
+        self.reset_crop_btn = QPushButton("Reset Crop")
         self.reset_crop_btn.setMinimumWidth(100)
         self.reset_crop_btn.clicked.connect(self.resetCrop)
         toolbar.addWidget(self.reset_crop_btn)
 
         toolbar.addSeparator()
 
-        self.delete_btn = QPushButton('Delete Selected Pages')
+        self.delete_btn = QPushButton("Delete Selected Pages")
         self.delete_btn.setMinimumWidth(150)
         self.delete_btn.clicked.connect(self.deleteSelectedPages)
         toolbar.addWidget(self.delete_btn)
@@ -273,7 +306,7 @@ class PDFViewer(QMainWindow):
         toolbar.addSeparator()
 
         # Add Undo button
-        self.undo_btn = QPushButton('Undo')
+        self.undo_btn = QPushButton("Undo")
         self.undo_btn.setMinimumWidth(80)
         self.undo_btn.clicked.connect(self.undo)
         self.undo_btn.setEnabled(False)
@@ -283,8 +316,8 @@ class PDFViewer(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
 
-        self.save_btn = QPushButton('Save PDF')
-        self.save_btn.setObjectName('saveButton')
+        self.save_btn = QPushButton("Save PDF")
+        self.save_btn.setObjectName("saveButton")
         self.save_btn.setMinimumWidth(110)
         self.save_btn.clicked.connect(self.savePDF)
         toolbar.addWidget(self.save_btn)
@@ -320,7 +353,7 @@ class PDFViewer(QMainWindow):
         self.single_view.hide()
         self.view_stack_layout.addWidget(self.odd_view)
         self.view_stack_layout.addWidget(self.even_view)
-        
+
         content_layout.addWidget(self.view_stack)
         main_layout.addWidget(content_widget)
         self.statusBar().showMessage(
@@ -334,6 +367,27 @@ class PDFViewer(QMainWindow):
         self.odd_view_pixmap_cache = None
         self.even_view_pixmap_cache = None
 
+    def _refresh_dirty_state(self):
+        """Derive whether the loaded document has unexported edits."""
+        self.is_dirty = bool(
+            self.active_crop_info
+            or self.whiteout_operations
+            or self.redaction_operations
+            or self.page_map != list(range(self.original_page_count))
+        )
+
+    def _confirm_discard_changes(self) -> bool:
+        if not self.is_dirty:
+            return True
+        response = QMessageBox.question(
+            self,
+            "Discard unsaved edits?",
+            "The current edits have not been exported. Discard them?",
+            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return response == QMessageBox.StandardButton.Discard
+
     def resetCrop(self):
         if not self.active_crop_info:
             QMessageBox.information(self, "Info", "No crop is currently active.")
@@ -341,29 +395,36 @@ class PDFViewer(QMainWindow):
 
         self.pushUndo(include_pdf=False)
         self.active_crop_info = None
+        self._refresh_dirty_state()
         self.pending_status_message = "Crop reset."
         self.reloadImages()
 
     def setActiveTool(self, tool):
-        if tool == 'whiteout' and self.active_crop_info:
+        if tool in {"whiteout", "redact"} and self.active_crop_info:
             QMessageBox.warning(
                 self,
                 "Reset Crop First",
-                "Whiteout cannot be positioned reliably on an active cropped preview. "
-                "Reset the crop, apply whiteout, then crop again.",
+                "Masks and redactions cannot be positioned reliably on an active cropped "
+                "preview. Reset the crop, apply the operation, then crop again.",
             )
-            tool = 'crop'
+            tool = "crop"
 
-        self.active_tool = tool if tool in {'crop', 'whiteout'} else 'crop'
-        self.crop_tool_btn.setChecked(self.active_tool == 'crop')
-        self.whiteout_btn.setChecked(self.active_tool == 'whiteout')
-        view_tool = 'whiteout' if self.active_tool == 'whiteout' else 'select'
+        self.active_tool = tool if tool in {"crop", "whiteout", "redact"} else "crop"
+        self.crop_tool_btn.setChecked(self.active_tool == "crop")
+        self.whiteout_btn.setChecked(self.active_tool == "whiteout")
+        self.redact_btn.setChecked(self.active_tool == "redact")
+        view_tool = self.active_tool if self.active_tool in {"whiteout", "redact"} else "select"
         for view in [self.single_view, self.odd_view, self.even_view]:
             view.setTool(view_tool)
 
-        if self.active_tool == 'whiteout':
+        if self.active_tool == "whiteout":
             self.statusBar().showMessage(
-                "Whiteout tool selected. Drag over unwanted content. Selected pages take priority.",
+                "Visual Mask selected. It only covers content; selected pages take priority.",
+                6000,
+            )
+        elif self.active_tool == "redact":
+            self.statusBar().showMessage(
+                "Redact selected. Drag to permanently remove page content; selected pages take priority.",
                 6000,
             )
         else:
@@ -375,7 +436,7 @@ class PDFViewer(QMainWindow):
 
     def pickColor(self):
         for view in [self.single_view, self.odd_view, self.even_view]:
-            view.setTool('pick_color')
+            view.setTool("pick_color")
         self.statusBar().showMessage("Click a page pixel to choose the whiteout color.", 6000)
 
     def onColorPicked(self, color):
@@ -384,7 +445,7 @@ class PDFViewer(QMainWindow):
             f"Whiteout color set to RGB({int(color.red())}, {int(color.green())}, {int(color.blue())}).",
             6000,
         )
-        self.setActiveTool('whiteout' if not self.active_crop_info else 'crop')
+        self.setActiveTool("whiteout" if not self.active_crop_info else "crop")
 
     def pushUndo(self, include_pdf=True):
         if self.pdf_doc:
@@ -393,20 +454,22 @@ class PDFViewer(QMainWindow):
                     "pdf_bytes": self.pdf_doc.tobytes() if include_pdf else None,
                     "page_map": list(self.page_map),
                     "whiteouts": [dict(operation) for operation in self.whiteout_operations],
+                    "redactions": [dict(operation) for operation in self.redaction_operations],
                     "active_crop_info": clone_crop_info(self.active_crop_info),
                     "selected_pages": set(self.selected_pages),
                     "selection_anchor": self.selection_anchor,
                     "preview_page_num": self.preview_page_num,
+                    "is_dirty": self.is_dirty,
                 }
             )
-            if len(self.undo_stack) > 10: # Limit stack size
+            if len(self.undo_stack) > 10:  # Limit stack size
                 self.undo_stack.pop(0)
             self.updateActionState()
 
     def undo(self):
         if not self.undo_stack:
             return
-        
+
         try:
             self.statusBar().showMessage("Restoring previous document state...")
             snapshot = self.undo_stack.pop()
@@ -417,10 +480,12 @@ class PDFViewer(QMainWindow):
                 self.pdf_doc = fitz.open("pdf", snapshot["pdf_bytes"])
             self.page_map = list(snapshot["page_map"])
             self.whiteout_operations = list(snapshot["whiteouts"])
+            self.redaction_operations = list(snapshot.get("redactions", []))
             self.active_crop_info = clone_crop_info(snapshot.get("active_crop_info"))
             self.selected_pages = set(snapshot.get("selected_pages", set()))
             self.selection_anchor = snapshot.get("selection_anchor")
             self.preview_page_num = snapshot.get("preview_page_num")
+            self.is_dirty = bool(snapshot.get("is_dirty", False))
             self.pending_status_message = "Undo complete."
             self.reloadImages()
         except Exception as e:
@@ -430,7 +495,7 @@ class PDFViewer(QMainWindow):
     def sync_selection_from_single(self, rect):
         if self._is_syncing_selection:
             return
-        
+
         self._is_syncing_selection = True
         self.odd_view.setSelection(rect)
         self.even_view.setSelection(rect)
@@ -439,7 +504,7 @@ class PDFViewer(QMainWindow):
     def sync_selection_to_even(self, rect):
         if self._is_syncing_selection:
             return
-        
+
         self._is_syncing_selection = True
         # Sync size to even view, but not position if a selection already exists
         even_selection = self.even_view.getSelectionRect()
@@ -471,21 +536,21 @@ class PDFViewer(QMainWindow):
             return
 
         selection = None
-        if self.view_mode == 'all':
+        if self.view_mode == "all":
             selection = self.single_view.getSelectionRect()
         else:
             selection = self.odd_view.getSelectionRect()
-        
+
         self.view_mode = mode
-        if mode == 'all':
+        if mode == "all":
             self.all_pages_action.setChecked(True)
         else:
             self.odd_even_action.setChecked(True)
-        
+
         self.updateOverlay()
-        
+
         if selection:
-            if self.view_mode == 'all':
+            if self.view_mode == "all":
                 self.single_view.setSelection(selection)
             else:
                 self.odd_view.setSelection(selection)
@@ -494,12 +559,13 @@ class PDFViewer(QMainWindow):
         help_text = """<b>Basic Usage:</b>
 <ol>
 <li>Open a PDF using <b>File > Open PDF...</b> or by dragging it into the window.</li>
-<li>Choose <b>Crop Box</b> or <b>Whiteout</b> in the toolbar, then drag on the page view.</li>
+<li>Choose <b>Crop Box</b>, <b>Visual Mask</b>, or <b>Redact</b> in the toolbar, then drag on the page view.</li>
 <li>Click <b>Apply Crop</b> to preview a crop. You can restore it with <b>Reset Crop</b>.</li>
 <li>Click a thumbnail to select one page. Use <b>Ctrl</b> to toggle pages and <b>Shift</b> to select a range.</li>
-<li>Selected pages limit crop and whiteout operations and can be removed with <b>Delete Selected Pages</b>.</li>
+<li>Selected pages limit crop, masking, and redaction operations and can be removed with <b>Delete Selected Pages</b>.</li>
 <li>Use the <b>View</b> menu to switch between a single overlay of all pages or separate overlays for odd and even pages.</li>
-<li>Use <b>Undo</b> to restore the previous crop, whiteout, or page deletion.</li>
+<li><b>Visual Mask</b> only covers content. Use <b>Redact</b> to remove selected page content; metadata and attachments are not removed.</li>
+<li>Use <b>Undo</b> to restore the previous crop, mask, redaction, or page deletion.</li>
 <li>Save your changes with the purple <b>Save PDF</b> button.</li>
 </ol>"""
         QMessageBox.information(self, "About PyCropPDF", help_text)
@@ -509,28 +575,28 @@ class PDFViewer(QMainWindow):
             return
 
         selection = None
-        is_exiting_preview = (self.preview_page_num == page_num)
-        
-        if self.preview_page_num is not None: # Currently in preview
+        is_exiting_preview = self.preview_page_num == page_num
+
+        if self.preview_page_num is not None:  # Currently in preview
             selection = self.single_view.getSelectionRect()
-        elif self.view_mode == 'all':
+        elif self.view_mode == "all":
             selection = self.single_view.getSelectionRect()
-        else: # odd_even mode
+        else:  # odd_even mode
             selection = self.odd_view.getSelectionRect()
 
         if is_exiting_preview:
             self.preview_page_num = None
         else:
             self.preview_page_num = page_num
-        
+
         self.updateOverlay()
 
         if selection:
-            if self.preview_page_num is not None: # In preview mode (or just entered)
+            if self.preview_page_num is not None:  # In preview mode (or just entered)
                 self.single_view.setSelection(selection)
-            elif self.view_mode == 'all':
+            elif self.view_mode == "all":
                 self.single_view.setSelection(selection)
-            else: # odd/even view
+            else:  # odd/even view
                 self.odd_view.setSelection(selection)
 
         # Update thumbnail selection highlights
@@ -545,56 +611,71 @@ class PDFViewer(QMainWindow):
         self.even_view.clearSelection()
 
     def openPDF(self):
-        fileName, _ = QFileDialog.getOpenFileName(
-            self, 
-            "Open PDF",
-            "",
-            "PDF Files (*.pdf)"
-        )
+        fileName, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if fileName:
-            self.original_pdf_path = fileName  # Store the original path
-            self.pdf_path = fileName
             self.loadPDF(fileName)
 
-    def loadPDF(self, pdf_path):
+    def loadPDF(self, pdf_path, confirm_discard=True):
+        if self.is_processing:
+            self.statusBar().showMessage(
+                "Wait for the current operation to finish before opening another PDF.",
+                6000,
+            )
+            return False
+
+        new_document = None
         try:
-            if self.pdf_doc:
-                self.pdf_doc.close()
+            with open(pdf_path, "rb") as source_file:
+                source_bytes = source_file.read()
+            new_document = fitz.open("pdf", source_bytes)
+            if new_document.needs_pass:
+                raise ValueError("Password-protected PDFs are not supported yet.")
+            if len(new_document) == 0:
+                raise ValueError("The PDF contains no pages.")
+        except Exception as error:
+            if new_document is not None:
+                new_document.close()
+            QMessageBox.critical(self, "Error", f"Failed to load PDF: {error}")
+            return False
 
-            if not pdf_path.endswith('.temp.pdf') and not self.original_pdf_path:
-                self.original_pdf_path = pdf_path
+        if confirm_discard and not self._confirm_discard_changes():
+            new_document.close()
+            return False
 
-            self.pdf_doc = fitz.open(pdf_path)
-            self.pdf_path = pdf_path
-            self.active_crop_info = None
-            self.preview_page_num = None
-            self.pending_status_message = ""
-            self.undo_stack = []
-            self.page_map = list(range(len(self.pdf_doc)))
-            self.original_page_count = len(self.pdf_doc)
-            self.whiteout_operations = []
-            self.selected_pages = set()
-            self.selection_anchor = None
-            
-            for view in [self.single_view, self.odd_view, self.even_view]:
-                view.clearScene()
-                view.selecting = False
-                view.selection_start = None
-                view.selection_rect = None
+        old_document = self.pdf_doc
+        self.pdf_doc = new_document
+        self.pdf_path = os.path.abspath(pdf_path)
+        self.original_pdf_path = self.pdf_path
+        self.source_sha256 = sha256_bytes(source_bytes)
+        self.active_crop_info = None
+        self.preview_page_num = None
+        self.pending_status_message = ""
+        self.undo_stack = []
+        self.page_map = list(range(len(self.pdf_doc)))
+        self.original_page_count = len(self.pdf_doc)
+        self.whiteout_operations = []
+        self.redaction_operations = []
+        self.selected_pages = set()
+        self.selection_anchor = None
+        self.is_dirty = False
 
-            self.setActiveTool('crop')
-            self.reloadImages()
+        for view in [self.single_view, self.odd_view, self.even_view]:
+            view.clearScene()
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load PDF: {str(e)}")
-            self.setUIProcessing(False)
+        if old_document is not None:
+            old_document.close()
+        self.setActiveTool("crop")
+        self.reloadImages()
+        return True
 
     def reloadImages(self):
-        if not self.pdf_doc:
+        if self.pdf_doc is None or self.is_processing:
             return
 
         self.setUIProcessing(True)
         self.invalidate_pixmap_cache()
+        self._operation_id += 1
+        operation_id = self._operation_id
 
         num_pages = len(self.pdf_doc)
         if num_pages == 0:
@@ -606,23 +687,33 @@ class PDFViewer(QMainWindow):
         self.images = [None] * num_pages
         self.pages_rendered = 0
         self.statusBar().showMessage(f"Rendering page previews: 0/{num_pages}...")
-        
+
         pdf_bytes = self.pdf_doc.tobytes()
         worker = RenderAllPagesWorker(pdf_bytes, num_pages, self.active_crop_info)
-        worker.signals.result.connect(self.pageRendered)
-        worker.signals.error.connect(self.processingError)
-        worker.signals.finished.connect(self.processingFinished)
+        worker.signals.result.connect(
+            lambda result, operation_id=operation_id: self.pageRendered(operation_id, result)
+        )
+        worker.signals.error.connect(
+            lambda error, operation_id=operation_id: self.processingError(operation_id, error)
+        )
+        worker.signals.finished.connect(
+            lambda operation_id=operation_id: self.processingFinished(operation_id)
+        )
         self.threadpool.start(worker)
 
-    def pageRendered(self, result):
+    def pageRendered(self, operation_id, result):
+        if operation_id != self._operation_id or not self.is_processing:
+            return
         page_num, image = result
+        if page_num >= len(self.images):
+            return
         self.images[page_num] = image
         self.pages_rendered += 1
         self.statusBar().showMessage(
             f"Rendering page previews: {self.pages_rendered}/{len(self.pdf_doc)}..."
         )
-        
-        if self.pages_rendered == len(self.pdf_doc):
+
+        if self.pdf_doc is not None and self.pages_rendered == len(self.pdf_doc):
             self.updateThumbnails()
             self.updateOverlay()
 
@@ -630,15 +721,17 @@ class PDFViewer(QMainWindow):
         self.single_view.show()
         self.odd_view.hide()
         self.even_view.hide()
-        
+
         self.single_view.clearScene()
-        
+
         if 0 <= page_num < len(self.images):
             image = self.images[page_num]
             pixmap = QPixmap.fromImage(image)
             self.single_view.scene.addPixmap(pixmap)
             self.single_view.setSceneRect(QRectF(pixmap.rect()))
-            self.single_view.fitInView(self.single_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.single_view.fitInView(
+                self.single_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+            )
 
     def updateOverlay(self):
         if not self.images:
@@ -648,7 +741,7 @@ class PDFViewer(QMainWindow):
             self.showSinglePagePreview(self.preview_page_num)
             return
 
-        if self.view_mode == 'all':
+        if self.view_mode == "all":
             self.single_view.show()
             self.odd_view.hide()
             self.even_view.hide()
@@ -662,9 +755,9 @@ class PDFViewer(QMainWindow):
     def updateSingleViewOverlay(self):
         if not self.images:
             return
-            
+
         self.single_view.clearScene()
-        
+
         if self.single_view_pixmap_cache is None:
             # Find maximum dimensions
             valid_images = [img for img in self.images if img]
@@ -672,11 +765,11 @@ class PDFViewer(QMainWindow):
                 return
             max_width = max(img.width() for img in valid_images)
             max_height = max(img.height() for img in valid_images)
-            
+
             # Create a transparent base image of maximum size
             base_img = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
             base_img.fill(Qt.GlobalColor.transparent)
-            
+
             painter = QPainter(base_img)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
@@ -699,12 +792,14 @@ class PDFViewer(QMainWindow):
 
         self.single_view.scene.addPixmap(self.single_view_pixmap_cache)
         self.single_view.setSceneRect(QRectF(self.single_view_pixmap_cache.rect()))
-        self.single_view.fitInView(self.single_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.single_view.fitInView(
+            self.single_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+        )
 
     def updateSplitViewOverlay(self):
         if not self.images:
             return
-            
+
         self.odd_view.clearScene()
         self.even_view.clearScene()
 
@@ -721,7 +816,7 @@ class PDFViewer(QMainWindow):
             if self.odd_view_pixmap_cache is None:
                 base_odd = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
                 base_odd.fill(Qt.GlobalColor.transparent)
-                
+
                 painter = QPainter(base_odd)
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
@@ -744,7 +839,9 @@ class PDFViewer(QMainWindow):
 
             self.odd_view.scene.addPixmap(self.odd_view_pixmap_cache)
             self.odd_view.setSceneRect(QRectF(self.odd_view_pixmap_cache.rect()))
-            self.odd_view.fitInView(self.odd_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.odd_view.fitInView(
+                self.odd_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+            )
 
         # Process even pages
         even_pages = [img for img in self.images[1::2] if img]
@@ -752,7 +849,7 @@ class PDFViewer(QMainWindow):
             if self.even_view_pixmap_cache is None:
                 base_even = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
                 base_even.fill(Qt.GlobalColor.transparent)
-                
+
                 painter = QPainter(base_even)
                 painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
@@ -775,7 +872,9 @@ class PDFViewer(QMainWindow):
 
             self.even_view.scene.addPixmap(self.even_view_pixmap_cache)
             self.even_view.setSceneRect(QRectF(self.even_view_pixmap_cache.rect()))
-            self.even_view.fitInView(self.even_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.even_view.fitInView(
+                self.even_view.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio
+            )
 
     def updateThumbnails(self):
         # Reset any existing row stretches to prevent alignment issues with varying page counts
@@ -860,14 +959,17 @@ class PDFViewer(QMainWindow):
             "Use Ctrl to toggle pages or Shift to select a range.",
             6000,
         )
-    
+
     def dragEnterEvent(self, event):
+        if self.is_processing:
+            event.ignore()
+            return
         try:
             mime_data = event.mimeData()
             if mime_data.hasUrls():
                 for url in mime_data.urls():
                     file_path = url.toLocalFile()
-                    if file_path.lower().endswith('.pdf'):
+                    if file_path.lower().endswith(".pdf"):
                         event.accept()
                         return
             event.ignore()
@@ -875,11 +977,14 @@ class PDFViewer(QMainWindow):
             event.ignore()
 
     def dragMoveEvent(self, event):
+        if self.is_processing:
+            event.ignore()
+            return
         try:
             mime_data = event.mimeData()
             if mime_data.hasUrls():
                 for url in mime_data.urls():
-                    if url.toLocalFile().lower().endswith('.pdf'):
+                    if url.toLocalFile().lower().endswith(".pdf"):
                         event.accept()
                         return
             event.ignore()
@@ -887,26 +992,62 @@ class PDFViewer(QMainWindow):
             event.ignore()
 
     def dropEvent(self, event):
+        if self.is_processing:
+            event.ignore()
+            self.statusBar().showMessage(
+                "Wait for the current operation to finish before opening another PDF.",
+                6000,
+            )
+            return
         try:
             mime_data = event.mimeData()
             if mime_data.hasUrls():
                 for url in mime_data.urls():
                     file_path = url.toLocalFile()
-                    if file_path.lower().endswith('.pdf'):
-                        self.original_pdf_path = file_path
-                        self.pdf_path = file_path
-                        self.loadPDF(file_path)
-                        event.accept()
+                    if file_path.lower().endswith(".pdf"):
+                        if self.loadPDF(file_path):
+                            event.accept()
+                        else:
+                            event.ignore()
                         return
             event.ignore()
         except Exception:
             event.ignore()
 
+    def _current_image_dimensions(self):
+        return [(image.width(), image.height()) if image else (0, 0) for image in self.images]
+
+    def _canvas_dimensions(self, page_num):
+        image_dims = self._current_image_dimensions()
+        if self.preview_page_num is not None:
+            return image_dims[page_num]
+        valid_dims = [(width, height) for width, height in image_dims if width and height]
+        if not valid_dims:
+            raise ValueError("No page previews are available.")
+        return max(width for width, _ in valid_dims), max(height for _, height in valid_dims)
+
+    def _visible_pdf_rect_for_page(self, page_num):
+        if self.active_crop_info:
+            crop_rect = self.active_crop_info.get("rects", {}).get(page_num)
+            if crop_rect:
+                return crop_rect
+        return self.pdf_doc[page_num].cropbox
+
+    def _scene_rect_to_pdf_rect(self, scene_rect, page_num):
+        image_dims = self._current_image_dimensions()
+        return scene_rect_to_pdf_coords(
+            scene_rect,
+            image_dims[page_num],
+            self._canvas_dimensions(page_num),
+            self.pdf_doc[page_num],
+            self._visible_pdf_rect_for_page(page_num),
+        )
+
     def cropSelection(self):
-        if self.is_processing or not self.pdf_doc:
+        if self.is_processing or self.pdf_doc is None:
             return
 
-        crop_rects = {}
+        scene_rects_by_page = {}
         selected_targets = set(self.getSelectedPages())
         if self.preview_page_num is not None:
             scene_rect = self.single_view.getSelectionRect()
@@ -915,15 +1056,15 @@ class PDFViewer(QMainWindow):
                 return
             target_pages = selected_targets or {self.preview_page_num}
             for page_num in target_pages:
-                crop_rects[page_num] = QRectF(scene_rect)
-        elif self.view_mode == 'all':
+                scene_rects_by_page[page_num] = scene_rect
+        elif self.view_mode == "all":
             scene_rect = self.single_view.getSelectionRect()
             if not scene_rect:
                 QMessageBox.warning(self, "Warning", "Please draw a crop box first.")
                 return
             target_pages = selected_targets or set(range(len(self.pdf_doc)))
             for page_num in target_pages:
-                crop_rects[page_num] = QRectF(scene_rect)
+                scene_rects_by_page[page_num] = scene_rect
         else:
             odd_rect = self.odd_view.getSelectionRect()
             even_rect = self.even_view.getSelectionRect()
@@ -933,13 +1074,13 @@ class PDFViewer(QMainWindow):
             if odd_rect:
                 for i in range(0, len(self.pdf_doc), 2):
                     if not selected_targets or i in selected_targets:
-                        crop_rects[i] = QRectF(odd_rect)
+                        scene_rects_by_page[i] = odd_rect
             if even_rect:
                 for i in range(1, len(self.pdf_doc), 2):
                     if not selected_targets or i in selected_targets:
-                        crop_rects[i] = QRectF(even_rect)
+                        scene_rects_by_page[i] = even_rect
 
-        if not crop_rects:
+        if not scene_rects_by_page:
             QMessageBox.warning(
                 self,
                 "Warning",
@@ -947,138 +1088,163 @@ class PDFViewer(QMainWindow):
             )
             return
 
+        try:
+            crop_rects = {
+                int(page_num): rect_to_tuple(self._scene_rect_to_pdf_rect(scene_rect, page_num))
+                for page_num, scene_rect in scene_rects_by_page.items()
+            }
+        except (IndexError, ValueError) as error:
+            QMessageBox.warning(self, "Invalid Crop", str(error))
+            return
+
         self.pushUndo(include_pdf=False)
+        retained_rects = (
+            dict(self.active_crop_info.get("rects", {})) if self.active_crop_info else {}
+        )
+        retained_rects.update(crop_rects)
         self.active_crop_info = {
-            'rects': crop_rects,
-            'view_mode': self.view_mode,
-            'image_dims': [
-                (img.width(), img.height()) if img else (0, 0)
-                for img in self.images
-            ],
+            "rects": retained_rects,
+            "view_mode": self.view_mode,
+            "image_dims": (
+                list(self.active_crop_info.get("image_dims", []))
+                if self.active_crop_info
+                else self._current_image_dimensions()
+            ),
         }
+        self._refresh_dirty_state()
 
         self.pending_status_message = (
-            f"Crop preview applied to {len(crop_rects)} page"
-            f"{'s' if len(crop_rects) != 1 else ''}."
+            f"Crop preview applied to {len(crop_rects)} page{'s' if len(crop_rects) != 1 else ''}."
         )
         self.reloadImages()
 
+    def _target_pages_for_rectangle_request(self, sender):
+        target_pages = self.getSelectedPages()
+        if target_pages:
+            return target_pages
+        if self.preview_page_num is not None:
+            return [self.preview_page_num]
+        if sender == self.single_view:
+            return list(range(len(self.pdf_doc)))
+        if sender == self.odd_view:
+            return list(range(0, len(self.pdf_doc), 2))
+        if sender == self.even_view:
+            return list(range(1, len(self.pdf_doc), 2))
+        return []
+
     def handleWhiteoutRequest(self, rect):
-        if self.is_processing or not self.pdf_doc:
+        self._handle_rectangle_request(rect, secure_redaction=False)
+
+    def handleRedactionRequest(self, rect):
+        self._handle_rectangle_request(rect, secure_redaction=True)
+
+    def _handle_rectangle_request(self, rect, secure_redaction):
+        if self.is_processing or self.pdf_doc is None:
             return
 
         if self.active_crop_info:
-            QMessageBox.warning(self, "Warning", "Cannot apply whiteout while a crop is active. Please Reset Crop first.")
+            QMessageBox.warning(
+                self,
+                "Reset Crop First",
+                "Masks and redactions cannot be positioned reliably on an active cropped preview. "
+                "Please Reset Crop first.",
+            )
             return
 
-        sender = self.sender()
-        target_pages = self.getSelectedPages()
-
-        if target_pages:
-            pass
-        elif self.preview_page_num is not None:
-            target_pages = [self.preview_page_num]
-        elif sender == self.single_view:
-            target_pages = list(range(len(self.pdf_doc)))
-        elif sender == self.odd_view:
-            target_pages = list(range(0, len(self.pdf_doc), 2))
-        elif sender == self.even_view:
-            target_pages = list(range(1, len(self.pdf_doc), 2))
-        
+        target_pages = self._target_pages_for_rectangle_request(self.sender())
         if not target_pages:
             return
 
-        self.applyWhiteout(rect, target_pages)
+        if secure_redaction:
+            self.applyRedaction(rect, target_pages)
+        else:
+            self.applyWhiteout(rect, target_pages)
 
     def applyWhiteout(self, rect, target_pages):
-        # Prepare for translation
-        valid_images = [img for img in self.images if img]
-        if not valid_images:
-            return
-            
-        max_width = max(img.width() for img in valid_images)
-        max_height = max(img.height() for img in valid_images)
-        
-        max_dims = (max_width, max_height)
-        
-        # We need page dims for each page
-        all_page_dims = [(img.width(), img.height()) if img else (0,0) for img in self.images]
+        """Compatibility entry point for tests and integrations using visual masking."""
+        self._apply_rectangle_operation(rect, target_pages, secure_redaction=False)
 
+    def applyRedaction(self, rect, target_pages):
+        """Apply content-removing redactions to the requested pages."""
+        self._apply_rectangle_operation(rect, target_pages, secure_redaction=True)
+
+    def _apply_rectangle_operation(self, rect, target_pages, secure_redaction):
+        try:
+            pdf_rects = {
+                page_num: self._scene_rect_to_pdf_rect(rect, page_num) for page_num in target_pages
+            }
+        except (IndexError, ValueError) as error:
+            QMessageBox.warning(self, "Invalid Selection", str(error))
+            return
+
+        before_pdf_bytes = self.pdf_doc.tobytes()
+        before_whiteouts = [dict(operation) for operation in self.whiteout_operations]
+        before_redactions = [dict(operation) for operation in self.redaction_operations]
+        before_dirty = self.is_dirty
+        operation_name = "redaction" if secure_redaction else "visual mask"
         try:
             self.statusBar().showMessage(
-                f"Applying whiteout to {len(target_pages)} page"
+                f"Applying {operation_name} to {len(target_pages)} page"
                 f"{'s' if len(target_pages) != 1 else ''}..."
             )
-            self.pushUndo() # Save state before modification
+            self.pushUndo()
 
             for page_num in target_pages:
                 page = self.pdf_doc[page_num]
-                
-                visual_rect = None
-                
-                # If in single page preview, the rect is relative to that page's image (0,0)
-                if self.preview_page_num is not None:
-                    page_dims = all_page_dims[page_num]
-                    ref_rect = page.rect
-                    scale_factor_x = ref_rect.width / page_dims[0] if page_dims[0] > 0 else 0
-                    scale_factor_y = ref_rect.height / page_dims[1] if page_dims[1] > 0 else 0
-                    
-                    crop_x0 = rect.x() * scale_factor_x + ref_rect.x0
-                    crop_y0 = rect.y() * scale_factor_y + ref_rect.y0
-                    crop_x1 = crop_x0 + (rect.width() * scale_factor_x)
-                    crop_y1 = crop_y0 + (rect.height() * scale_factor_y)
-                    
-                    visual_rect = fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
-                else:
-                    # Translate to visual PDF coordinates using overlay logic
-                    visual_rect = _translate_rect_to_pdf_coords(
-                        rect,
-                        all_page_dims[page_num],
-                        page.rect,
-                        page_num,
-                        self.view_mode,
-                        max_dims,
-                        max_dims, # max_odd_dims
-                        max_dims  # max_even_dims
-                    )
-                
-                # Transform to physical coordinates for drawing
-                pdf_rect = visual_rect * page.derotation_matrix
-                
-                # Draw rectangle with selected color
-                page.draw_rect(pdf_rect, color=self.whiteout_color, fill=self.whiteout_color, width=0)
-                original_page = self.page_map[page_num] if page_num < len(self.page_map) else page_num
-                self.whiteout_operations.append(
-                    {
-                        "output_page": page_num + 1,
-                        "original_page": original_page + 1,
-                        "rect": [round(float(value), 3) for value in pdf_rect],
-                        "color": [round(float(value), 4) for value in self.whiteout_color],
-                    }
+                pdf_rect = pdf_rects[page_num]
+                original_page = (
+                    self.page_map[page_num] if page_num < len(self.page_map) else page_num
                 )
+                operation = {
+                    "output_page": page_num + 1,
+                    "original_page": original_page + 1,
+                    "rect": [round(float(value), 3) for value in pdf_rect],
+                }
+                if secure_redaction:
+                    page.add_redact_annot(pdf_rect, fill=(0, 0, 0), cross_out=False)
+                    page.apply_redactions(images=2, graphics=2, text=0)
+                    self.redaction_operations.append(operation)
+                else:
+                    page.draw_rect(
+                        pdf_rect,
+                        color=self.whiteout_color,
+                        fill=self.whiteout_color,
+                        width=0,
+                    )
+                    operation["color"] = [round(float(value), 4) for value in self.whiteout_color]
+                    self.whiteout_operations.append(operation)
 
             self.pending_status_message = (
-                f"Whiteout applied to {len(target_pages)} page"
+                f"{operation_name.capitalize()} applied to {len(target_pages)} page"
                 f"{'s' if len(target_pages) != 1 else ''}."
             )
+            self._refresh_dirty_state()
             self.reloadImages()
-            
-        except Exception as e:
-            self.setUIProcessing(False)
-            QMessageBox.critical(self, "Error", f"Failed to apply whiteout: {str(e)}")
+        except Exception as error:
+            self.pdf_doc.close()
+            self.pdf_doc = fitz.open("pdf", before_pdf_bytes)
+            self.whiteout_operations = before_whiteouts
+            self.redaction_operations = before_redactions
+            self.is_dirty = before_dirty
+            if self.undo_stack:
+                self.undo_stack.pop()
+            QMessageBox.critical(self, "Error", f"Failed to apply {operation_name}: {error}")
 
     def deleteSelectedPages(self):
-        if not self.pdf_doc:
+        if self.pdf_doc is None:
             QMessageBox.warning(self, "Warning", "No PDF is open.")
             return
-            
+
         selected_pages = sorted(self.getSelectedPages(), reverse=True)
         if not selected_pages:
             QMessageBox.warning(self, "Warning", "Please select pages to delete.")
             return
+        if len(selected_pages) >= len(self.pdf_doc):
+            QMessageBox.warning(self, "Warning", "A PDF must retain at least one page.")
+            return
 
         try:
-            self.pushUndo() # Save state before modification
+            self.pushUndo()  # Save state before modification
             self.invalidate_pixmap_cache()
 
             deleted_set = set(selected_pages)
@@ -1100,19 +1266,22 @@ class PDFViewer(QMainWindow):
 
             self.selected_pages = set()
             self.selection_anchor = None
+            self._refresh_dirty_state()
             self.updateThumbnails()
             self.updateOverlay()
             self.updateActionState()
             self.statusBar().showMessage(
-                f"Deleted {len(selected_pages)} page"
-                f"{'s' if len(selected_pages) != 1 else ''}.",
+                f"Deleted {len(selected_pages)} page{'s' if len(selected_pages) != 1 else ''}.",
                 6000,
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to delete pages: {str(e)}")
 
     def savePDF(self):
-        if self.is_processing or not self.pdf_doc:
+        if self.is_processing or self.pdf_doc is None:
+            return
+        if len(self.pdf_doc) == 0:
+            QMessageBox.warning(self, "Cannot Save", "A PDF must contain at least one page.")
             return
 
         if self.save_directory:
@@ -1123,17 +1292,24 @@ class PDFViewer(QMainWindow):
                 base_name = os.path.splitext(original_name)[0]
                 save_path = os.path.join(self.save_directory, f"{base_name}_modified.pdf")
         else:
-            save_path, _ = QFileDialog.getSaveFileName(
-                self, "Save PDF", "", "PDF Files (*.pdf)"
-            )
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save PDF", "", "PDF Files (*.pdf)")
 
         if not save_path:
             return
+        if not save_path.lower().endswith(".pdf"):
+            save_path = f"{save_path}.pdf"
+
+        try:
+            pdf_bytes = self.pdf_doc.tobytes()
+        except Exception as error:
+            QMessageBox.critical(self, "Error", f"Failed to prepare PDF for saving: {error}")
+            return
 
         self.setUIProcessing(True)
+        self._operation_id += 1
+        operation_id = self._operation_id
         self.statusBar().showMessage("Saving PDF and provenance manifest...")
         deflate_enabled = not self.fast_save_action.isChecked()
-        pdf_bytes = self.pdf_doc.tobytes()
         manifest_path = self.manifest_path or f"{save_path}.pycroppdf.json"
         worker = SaveWorker(
             pdf_bytes,
@@ -1145,18 +1321,27 @@ class PDFViewer(QMainWindow):
             page_map=self.page_map,
             original_page_count=self.original_page_count,
             whiteouts=self.whiteout_operations,
+            redactions=self.redaction_operations,
+            source_sha256=self.source_sha256,
         )
-        worker.signals.result.connect(self.saveFinished)
-        worker.signals.error.connect(self.processingError)
-        worker.signals.finished.connect(self.processingFinished)
+        worker.signals.result.connect(
+            lambda result, operation_id=operation_id: self.saveFinished(operation_id, result)
+        )
+        worker.signals.error.connect(
+            lambda error, operation_id=operation_id: self.processingError(operation_id, error)
+        )
+        worker.signals.finished.connect(
+            lambda operation_id=operation_id: self.processingFinished(operation_id)
+        )
         self.threadpool.start(worker)
 
     def updateActionState(self):
-        has_document = self.pdf_doc is not None
+        has_document = self.pdf_doc is not None and len(self.pdf_doc) > 0
         available = has_document and not self.is_processing
         self.crop_tool_btn.setEnabled(available)
         self.whiteout_btn.setEnabled(available and not self.active_crop_info)
-        self.crop_btn.setEnabled(available and self.active_tool == 'crop')
+        self.redact_btn.setEnabled(available and not self.active_crop_info)
+        self.crop_btn.setEnabled(available and self.active_tool == "crop")
         self.reset_crop_btn.setEnabled(available and bool(self.active_crop_info))
         self.pick_color_btn.setEnabled(available)
         self.delete_btn.setEnabled(available)
@@ -1175,17 +1360,37 @@ class PDFViewer(QMainWindow):
         elif not is_processing and was_processing:
             QApplication.restoreOverrideCursor()
 
-    def saveFinished(self, success):
-        if success:
+    def saveFinished(self, operation_id, result):
+        if operation_id != self._operation_id:
+            return
+        if result.get("manifest_error"):
+            self.statusBar().showMessage(
+                "PDF saved, but the provenance manifest could not be finalized.", 10000
+            )
+            QMessageBox.warning(
+                self,
+                "Manifest Not Saved",
+                f"The PDF was saved to:\n{result['pdf_path']}\n\n"
+                f"The manifest could not be finalized:\n{result['manifest_error']}",
+            )
+        else:
+            self.is_dirty = False
+        if result.get("manifest_written"):
             self.statusBar().showMessage("PDF and provenance manifest saved successfully.", 8000)
+        elif not result.get("manifest_error"):
+            self.statusBar().showMessage("PDF saved successfully.", 8000)
 
-    def processingError(self, error_str):
+    def processingError(self, operation_id, error_str):
+        if operation_id != self._operation_id:
+            return
         self.pending_status_message = ""
         self.statusBar().showMessage("The operation failed.", 8000)
         QMessageBox.critical(self, "Error", f"An error occurred:\n{error_str}")
         print(error_str)
 
-    def processingFinished(self):
+    def processingFinished(self, operation_id):
+        if operation_id != self._operation_id:
+            return
         self.setUIProcessing(False)
         if self.pending_status_message:
             self.statusBar().showMessage(self.pending_status_message, 8000)
@@ -1194,17 +1399,21 @@ class PDFViewer(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # Only update overlay if a PDF is loaded and not currently processing pages
-        if self.pdf_doc and not self.is_processing:
+        if self.pdf_doc is not None and not self.is_processing:
             self.updateOverlay()
 
     def closeEvent(self, event):
-        if self.pdf_doc:
+        if self.is_processing:
+            QMessageBox.information(
+                self,
+                "Operation in Progress",
+                "Wait for the current operation to finish before closing.",
+            )
+            event.ignore()
+            return
+        if self.isVisible() and not self._confirm_discard_changes():
+            event.ignore()
+            return
+        if self.pdf_doc is not None:
             self.pdf_doc.close()
-        
-        if self.pdf_path and self.pdf_path.endswith('.temp.pdf'):
-            try:
-                os.remove(self.pdf_path)
-            except:
-                pass
-        
         super().closeEvent(event)

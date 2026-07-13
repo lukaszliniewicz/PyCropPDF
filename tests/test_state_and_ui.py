@@ -175,10 +175,7 @@ class ViewerInteractionTests(unittest.TestCase):
             document.new_page(width=300, height=400)
         self.viewer.pdf_doc = document
         self.viewer.page_map = [0, 1, 2]
-        self.viewer.images = [
-            QImage(300, 400, QImage.Format.Format_RGB888)
-            for _ in range(3)
-        ]
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888) for _ in range(3)]
         self.viewer.view_mode = "all"
         self.viewer.selected_pages = {1}
         self.viewer.single_view.setSelection(QRectF(10, 10, 200, 300))

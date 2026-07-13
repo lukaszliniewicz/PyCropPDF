@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycroppdf"
-version = "0.2.1"
+version = "0.3.0"
 authors = [
   { name="Lukasz Liniewicz" },
 ]
-description = "A PDF cropping utility for removing headers, footers, and margins from multiple pages at once."
+description = "A desktop utility for non-destructive PDF cropping, visual masking, and page-content redaction."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { file="LICENSE" }
 requires-python = ">=3.10"
@@ -18,8 +18,14 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "PyMuPDF",
-    "PyQt6",
+    "PyMuPDF>=1.24,<2",
+    "PyQt6>=6.5,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.8,<1",
 ]
 
 [project.urls]
@@ -27,3 +33,13 @@ dependencies = [
 
 [project.scripts]
 pycroppdf = "pycroppdf.run:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

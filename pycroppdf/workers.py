@@ -1,7 +1,12 @@
+"""Background workers and coordinate conversion for PDF rendering and saving."""
+
+from __future__ import annotations
+
 import concurrent.futures
 import os
 import tempfile
 import traceback
+from typing import Iterable
 
 import fitz
 from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
@@ -10,244 +15,323 @@ from PyQt6.QtGui import QImage
 from .provenance import build_manifest, sha256_file, write_manifest
 
 
+MAX_RENDER_WORKERS = 4
+_RENDER_PDF_BYTES: bytes | None = None
+_RENDER_CROP_RECTS: dict[int, tuple[float, float, float, float]] = {}
+
+
 class WorkerSignals(QObject):
-    """
-    Defines the signals available from a running worker thread.
-    """
+    """Signals emitted by a worker running outside the GUI thread."""
+
     finished = pyqtSignal()
     error = pyqtSignal(str)
     result = pyqtSignal(object)
 
 
-def _translate_rect_to_pdf_coords(scene_rect, page_dims, pdf_page_rect, page_num, 
-                                  view_mode, max_dims, max_odd_dims, max_even_dims):
-    """Translates a QRectF from scene coordinates to a fitz.Rect in PDF coordinates (visual)."""
-    page_width, page_height = page_dims
-    
-    if view_mode == 'all':
-        current_max_dims = max_dims
+def rect_to_tuple(rect: fitz.Rect | Iterable[float]) -> tuple[float, float, float, float]:
+    """Return a PDF rectangle as a picklable, immutable tuple."""
+    if all(hasattr(rect, attribute) for attribute in ("x", "y", "width", "height")):
+        normalized = fitz.Rect(
+            rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height()
+        )
     else:
-        # page_num 0 is the first page, which is ODD
-        if page_num % 2 == 0:  # Odd page
-            current_max_dims = max_odd_dims
-        else:  # Even page
-            current_max_dims = max_even_dims
-    
-    max_width, max_height = current_max_dims
-    x_offset = (max_width - page_width) // 2
-    y_offset = (max_height - page_height) // 2
-    
-    # Use the provided pdf_page_rect (usually page.rect) which matches the visual orientation
-    ref_rect = pdf_page_rect
-    scale_factor_x = ref_rect.width / page_width if page_width > 0 else 0
-    scale_factor_y = ref_rect.height / page_height if page_height > 0 else 0
-
-    crop_x0 = (scene_rect.x() - x_offset) * scale_factor_x + ref_rect.x0
-    crop_y0 = (scene_rect.y() - y_offset) * scale_factor_y + ref_rect.y0
-    crop_x1 = crop_x0 + (scene_rect.width() * scale_factor_x)
-    crop_y1 = crop_y0 + (scene_rect.height() * scale_factor_y)
-
-    crop_x0 = max(ref_rect.x0, min(crop_x0, ref_rect.x1))
-    crop_y0 = max(ref_rect.y0, min(crop_y0, ref_rect.y1))
-    crop_x1 = max(ref_rect.x0, min(crop_x1, ref_rect.x1))
-    crop_y1 = max(ref_rect.y0, min(crop_y1, ref_rect.y1))
-    return fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
+        normalized = fitz.Rect(rect)
+    return tuple(float(value) for value in normalized)
 
 
-def _render_page_task(args):
-    """Renders a single PDF page. For use with ProcessPoolExecutor."""
-    pdf_bytes, page_num, zoom_matrix, crop_args = args
-    pdf_doc = fitz.open("pdf", pdf_bytes)
-    page = pdf_doc[page_num]
-
-    clip_rect = None
-    if crop_args:
-        scene_rect = crop_args.get('rect')
-        if scene_rect:
-            visual_rect = _translate_rect_to_pdf_coords(
-                scene_rect,
-                crop_args['page_dims'],
-                page.rect,
-                page_num,
-                crop_args['view_mode'],
-                crop_args['max_dims'],
-                crop_args['max_odd_dims'],
-                crop_args['max_even_dims']
-            )
-            # Transform visual rect to physical coordinates for clip
-            clip_rect = visual_rect * page.derotation_matrix
-
-    pix = page.get_pixmap(matrix=zoom_matrix, clip=clip_rect)
-    # Return picklable data, not QImage
-    result = (page_num, pix.samples, pix.width, pix.height, pix.stride)
-    pdf_doc.close()
-    return result
+def _validate_rect(rect: fitz.Rect, description: str) -> fitz.Rect:
+    if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+        raise ValueError(f"{description} does not intersect the visible page area.")
+    return rect
 
 
+def _visible_pdf_rect_to_visual_rect(page: fitz.Page, pdf_rect: fitz.Rect) -> fitz.Rect:
+    """Convert an unrotated CropBox-relative PDF rectangle into displayed coordinates."""
+    crop_position = page.cropbox_position
+    local_rect = fitz.Rect(
+        pdf_rect.x0 - crop_position.x,
+        pdf_rect.y0 - crop_position.y,
+        pdf_rect.x1 - crop_position.x,
+        pdf_rect.y1 - crop_position.y,
+    )
+    return fitz.Rect(local_rect * page.rotation_matrix)
+
+
+def scene_rect_to_pdf_coords(
+    scene_rect,
+    page_image_dims: tuple[int, int],
+    canvas_dims: tuple[int, int],
+    page: fitz.Page,
+    visible_pdf_rect: fitz.Rect | Iterable[float] | None = None,
+) -> fitz.Rect:
+    """Map a selection in an overlay scene to an unrotated PDF page rectangle.
+
+    The display is a rasterized, potentially rotated view of the page's current
+    CropBox. ``visible_pdf_rect`` is the exact unrotated PDF rectangle rendered
+    into the raster; it is the current CropBox for an untouched page and an
+    active crop preview for a pending crop. Keeping this mapping explicit avoids
+    losing a pre-existing CropBox or reinterpreting a cropped preview as a full
+    page.
+    """
+    image_width, image_height = page_image_dims
+    canvas_width, canvas_height = canvas_dims
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("The selected page has no renderable preview.")
+
+    visible_rect = fitz.Rect(visible_pdf_rect or page.cropbox)
+    visible_rect.intersect(page.cropbox)
+    _validate_rect(visible_rect, "The rendered page area")
+    visual_rect = _visible_pdf_rect_to_visual_rect(page, visible_rect)
+    _validate_rect(visual_rect, "The rendered page area")
+
+    x_offset = (canvas_width - image_width) // 2
+    y_offset = (canvas_height - image_height) // 2
+    scale_x = visual_rect.width / image_width
+    scale_y = visual_rect.height / image_height
+    selected_visual_rect = fitz.Rect(
+        visual_rect.x0 + (scene_rect.x() - x_offset) * scale_x,
+        visual_rect.y0 + (scene_rect.y() - y_offset) * scale_y,
+        visual_rect.x0 + (scene_rect.x() - x_offset + scene_rect.width()) * scale_x,
+        visual_rect.y0 + (scene_rect.y() - y_offset + scene_rect.height()) * scale_y,
+    )
+    selected_visual_rect.intersect(visual_rect)
+    _validate_rect(selected_visual_rect, "The selection")
+
+    local_pdf_rect = fitz.Rect(selected_visual_rect * page.derotation_matrix)
+    crop_position = page.cropbox_position
+    selected_pdf_rect = fitz.Rect(
+        local_pdf_rect.x0 + crop_position.x,
+        local_pdf_rect.y0 + crop_position.y,
+        local_pdf_rect.x1 + crop_position.x,
+        local_pdf_rect.y1 + crop_position.y,
+    )
+    selected_pdf_rect.intersect(visible_rect)
+    return _validate_rect(selected_pdf_rect, "The selection")
+
+
+def _initialise_render_process(
+    pdf_bytes: bytes,
+    crop_rects: dict[int, tuple[float, float, float, float]],
+) -> None:
+    """Store the immutable render inputs once per process."""
+    global _RENDER_PDF_BYTES, _RENDER_CROP_RECTS
+    _RENDER_PDF_BYTES = pdf_bytes
+    _RENDER_CROP_RECTS = crop_rects
+
+
+def _render_page_task(page_num: int):
+    """Render one page using the process-local PDF source."""
+    if _RENDER_PDF_BYTES is None:
+        raise RuntimeError("Render process was not initialized.")
+
+    pdf_doc = fitz.open("pdf", _RENDER_PDF_BYTES)
+    try:
+        page = pdf_doc[page_num]
+        clip_rect = None
+        crop_rect = _RENDER_CROP_RECTS.get(page_num)
+        if crop_rect:
+            clip_rect = fitz.Rect(crop_rect)
+            clip_rect.intersect(page.cropbox)
+            _validate_rect(clip_rect, f"Crop rectangle for page {page_num + 1}")
+
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=clip_rect)
+        return page_num, pix.samples, pix.width, pix.height, pix.stride
+    finally:
+        pdf_doc.close()
 
 
 class RenderAllPagesWorker(QRunnable):
-    """
-    Worker thread for rendering all PDF pages in parallel.
-    """
-    def __init__(self, pdf_bytes, num_pages, crop_info=None):
+    """Render all previews with a bounded pool of PDF rendering processes."""
+
+    def __init__(self, pdf_bytes: bytes, num_pages: int, crop_info: dict | None = None):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.num_pages = num_pages
-        self.crop_info = crop_info
+        self.crop_info = crop_info or {}
 
-    def run(self):
+    def run(self) -> None:
         try:
-            zoom_matrix = fitz.Matrix(1.5, 1.5)
-            
-            crop_args_list = [None] * self.num_pages
-            if self.crop_info:
-                all_page_dims = self.crop_info['image_dims']
-                view_mode = self.crop_info['view_mode']
-                
-                max_dims, max_odd_dims, max_even_dims = (0,0), (0,0), (0,0)
-                max_width = max(w for w, h in all_page_dims) if all_page_dims else 0
-                max_height = max(h for w, h in all_page_dims) if all_page_dims else 0
-
-                if view_mode == 'all':
-                    max_dims = (max_width, max_height)
-                else:
-                    # For split view, both odd and even views are rendered on a canvas
-                    # sized to the max dimensions of ALL pages to ensure consistency.
-                    # We must use the same max dimensions here for coordinate translation.
-                    max_odd_dims = (max_width, max_height)
-                    max_even_dims = (max_width, max_height)
-
-                for i in range(self.num_pages):
-                    crop_args_list[i] = {
-                        'rect': self.crop_info['rects'].get(i),
-                        'page_dims': all_page_dims[i],
-                        'view_mode': view_mode,
-                        'max_dims': max_dims,
-                        'max_odd_dims': max_odd_dims,
-                        'max_even_dims': max_even_dims,
-                    }
-
-            tasks = [(self.pdf_bytes, i, zoom_matrix, crop_args_list[i]) for i in range(self.num_pages)]
-
-            with concurrent.futures.ProcessPoolExecutor() as executor:
-                for page_num, samples, width, height, stride in executor.map(_render_page_task, tasks):
-                    img = QImage(samples, width, height, stride, QImage.Format.Format_RGB888)
-                    self.signals.result.emit((page_num, img))
+            crop_rects = {
+                int(page_num): rect_to_tuple(rect)
+                for page_num, rect in self.crop_info.get("rects", {}).items()
+                if rect
+            }
+            process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
+            cpu_count = process_cpu_count() or 1
+            max_workers = min(self.num_pages, MAX_RENDER_WORKERS, max(1, cpu_count - 1))
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_initialise_render_process,
+                initargs=(self.pdf_bytes, crop_rects),
+            ) as executor:
+                for page_num, samples, width, height, stride in executor.map(
+                    _render_page_task,
+                    range(self.num_pages),
+                ):
+                    image = QImage(samples, width, height, stride, QImage.Format.Format_RGB888)
+                    self.signals.result.emit((page_num, image))
         except Exception:
             self.signals.error.emit(traceback.format_exc())
         finally:
             self.signals.finished.emit()
 
 
+def _resolve_operations(
+    operations: Iterable[dict],
+    page_map: list[int],
+) -> list[dict]:
+    output_page_by_original = {
+        original_page: output_page + 1 for output_page, original_page in enumerate(page_map)
+    }
+    resolved_operations = []
+    for operation in operations:
+        original_page = int(operation.get("original_page") or 0)
+        output_page = output_page_by_original.get(original_page - 1)
+        if output_page is None:
+            continue
+        resolved = dict(operation)
+        resolved["output_page"] = output_page
+        resolved_operations.append(resolved)
+    return resolved_operations
+
+
+def _temporary_output_path(directory: str, suffix: str) -> str:
+    file_descriptor, path = tempfile.mkstemp(prefix=".pycroppdf-", suffix=suffix, dir=directory)
+    os.close(file_descriptor)
+    os.unlink(path)
+    return path
+
+
 class SaveWorker(QRunnable):
-    """
-    Worker thread for saving PDF.
-    """
+    """Save an edited PDF and its provenance manifest without partial outputs."""
+
     def __init__(
         self,
-        pdf_bytes,
-        save_path,
-        crop_info=None,
-        deflate=False,
-        source_path=None,
-        manifest_path=None,
-        page_map=None,
-        original_page_count=None,
-        whiteouts=None,
+        pdf_bytes: bytes,
+        save_path: str,
+        crop_info: dict | None = None,
+        deflate: bool = False,
+        source_path: str | None = None,
+        manifest_path: str | None = None,
+        page_map: Iterable[int] | None = None,
+        original_page_count: int | None = None,
+        whiteouts: Iterable[dict] | None = None,
+        redactions: Iterable[dict] | None = None,
+        source_sha256: str | None = None,
     ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.save_path = save_path
-        self.crop_info = crop_info
+        self.crop_info = crop_info or {}
         self.deflate = deflate
         self.source_path = source_path
         self.manifest_path = manifest_path
         self.page_map = list(page_map or [])
         self.original_page_count = original_page_count
         self.whiteouts = list(whiteouts or [])
+        self.redactions = list(redactions or [])
+        self.source_sha256 = source_sha256
 
-    def run(self):
+    def run(self) -> None:
+        document = None
+        pdf_temporary_path = None
+        manifest_temporary_path = None
+        pdf_saved = False
         try:
-            source_sha256 = (
-                sha256_file(self.source_path)
-                if self.manifest_path and self.source_path and os.path.isfile(self.source_path)
-                else None
-            )
-            doc = fitz.open("pdf", self.pdf_bytes)
+            output_directory = os.path.dirname(os.path.abspath(self.save_path))
+            if not os.path.isdir(output_directory):
+                raise ValueError(f"Save directory does not exist: {output_directory}")
 
+            document = fitz.open("pdf", self.pdf_bytes)
+            output_page_count = len(document)
             applied_crops = []
-            # If crop is active, apply it to each page
-            if self.crop_info:
-                all_page_dims = self.crop_info['image_dims']
-                view_mode = self.crop_info['view_mode']
-                crop_rects = self.crop_info['rects']
-                
-                max_dims, max_odd_dims, max_even_dims = (0,0), (0,0), (0,0)
-                max_width = max(w for w, h in all_page_dims) if all_page_dims else 0
-                max_height = max(h for w, h in all_page_dims) if all_page_dims else 0
+            crop_rects = self.crop_info.get("rects", {})
+            for page_num, page in enumerate(document):
+                crop_rect = crop_rects.get(page_num)
+                if not crop_rect:
+                    continue
+                crop_rect = fitz.Rect(rect_to_tuple(crop_rect))
+                crop_rect.intersect(page.cropbox)
+                _validate_rect(crop_rect, f"Crop rectangle for page {page_num + 1}")
+                page.set_cropbox(crop_rect)
+                original_page = (
+                    self.page_map[page_num] if page_num < len(self.page_map) else page_num
+                )
+                applied_crops.append(
+                    {
+                        "output_page": page_num + 1,
+                        "original_page": original_page + 1,
+                        "rect": [round(float(value), 3) for value in crop_rect],
+                    }
+                )
 
-                if view_mode == 'all':
-                    max_dims = (max_width, max_height)
-                else:
-                    # For split view, both odd and even views are rendered on a canvas
-                    # sized to the max dimensions of ALL pages to ensure consistency.
-                    # We must use the same max dimensions here for coordinate translation.
-                    max_odd_dims = (max_width, max_height)
-                    max_even_dims = (max_width, max_height)
+            pdf_temporary_path = _temporary_output_path(output_directory, ".pdf")
+            document.save(pdf_temporary_path, garbage=2, deflate=self.deflate)
+            document.close()
+            document = None
 
-                for page_num, page in enumerate(doc):
-                    if page_num in crop_rects and crop_rects[page_num]:
-                        scene_rect = crop_rects[page_num]
-                        page_dims = all_page_dims[page_num]
-                        
-                        visual_rect = _translate_rect_to_pdf_coords(
-                            scene_rect, page_dims, page.rect, page_num, view_mode,
-                            max_dims, max_odd_dims, max_even_dims
-                        )
-                        # Transform visual rect to physical coordinates
-                        crop_rect = visual_rect * page.derotation_matrix
-                        page.set_cropbox(crop_rect)
-                        original_page = self.page_map[page_num] if page_num < len(self.page_map) else page_num
-                        applied_crops.append(
-                            {
-                                "output_page": page_num + 1,
-                                "original_page": original_page + 1,
-                                "rect": [round(float(value), 3) for value in crop_rect],
-                            }
-                        )
-            
-            doc.save(self.save_path, garbage=2, deflate=self.deflate)
-            doc.close()
-            if self.manifest_path and self.source_path and os.path.isfile(self.source_path):
-                resolved_page_map = self.page_map or list(range(int(self.original_page_count or 0)))
-                output_page_by_original = {
-                    original_page: output_page + 1
-                    for output_page, original_page in enumerate(resolved_page_map)
-                }
-                resolved_whiteouts = []
-                for whiteout in self.whiteouts:
-                    original_page = int(whiteout.get("original_page") or 0)
-                    if original_page - 1 not in output_page_by_original:
-                        continue
-                    resolved = dict(whiteout)
-                    resolved["output_page"] = output_page_by_original[original_page - 1]
-                    resolved_whiteouts.append(resolved)
+            if self.manifest_path:
+                if not self.source_path:
+                    raise ValueError("Cannot write provenance without the loaded source snapshot.")
+                source_sha256 = self.source_sha256
+                if source_sha256 is None:
+                    if not os.path.isfile(self.source_path):
+                        raise ValueError("Cannot hash the original source for provenance.")
+                    source_sha256 = sha256_file(self.source_path)
+                resolved_page_map = self.page_map or list(
+                    range(int(self.original_page_count or output_page_count))
+                )
                 manifest = build_manifest(
                     self.source_path,
                     self.save_path,
                     resolved_page_map,
                     int(self.original_page_count or len(resolved_page_map)),
                     crops=applied_crops,
-                    whiteouts=resolved_whiteouts,
+                    whiteouts=_resolve_operations(self.whiteouts, resolved_page_map),
+                    redactions=_resolve_operations(self.redactions, resolved_page_map),
                     source_sha256=source_sha256,
+                    output_sha256=sha256_file(pdf_temporary_path),
                 )
-                write_manifest(self.manifest_path, manifest)
-            self.signals.result.emit(True)
+                manifest_directory = os.path.dirname(os.path.abspath(self.manifest_path))
+                os.makedirs(manifest_directory, exist_ok=True)
+                manifest_temporary_path = _temporary_output_path(manifest_directory, ".json")
+                write_manifest(manifest_temporary_path, manifest)
 
+            os.replace(pdf_temporary_path, self.save_path)
+            pdf_temporary_path = None
+            pdf_saved = True
+            if manifest_temporary_path:
+                os.replace(manifest_temporary_path, self.manifest_path)
+                manifest_temporary_path = None
+            self.signals.result.emit(
+                {
+                    "pdf_path": self.save_path,
+                    "manifest_path": self.manifest_path,
+                    "manifest_written": bool(self.manifest_path),
+                }
+            )
         except Exception:
-            self.signals.error.emit(traceback.format_exc())
+            error = traceback.format_exc()
+            if pdf_saved:
+                self.signals.result.emit(
+                    {
+                        "pdf_path": self.save_path,
+                        "manifest_path": self.manifest_path,
+                        "manifest_written": False,
+                        "manifest_error": error,
+                    }
+                )
+            else:
+                self.signals.error.emit(error)
         finally:
+            if document is not None:
+                document.close()
+            for temporary_path in (pdf_temporary_path, manifest_temporary_path):
+                if temporary_path and os.path.exists(temporary_path):
+                    try:
+                        os.remove(temporary_path)
+                    except OSError:
+                        pass
             self.signals.finished.emit()
