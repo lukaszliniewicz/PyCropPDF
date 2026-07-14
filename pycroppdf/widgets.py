@@ -69,7 +69,10 @@ class PageGraphicsView(QGraphicsView):
         zoom_factor = 1.15
         if event.angleDelta().y() < 0:
             zoom_factor = 1.0 / zoom_factor
-        self.scale(zoom_factor, zoom_factor)
+        next_scale = self.transform().m11() * zoom_factor
+        if 0.1 <= next_scale <= 12.0:
+            self.scale(zoom_factor, zoom_factor)
+        event.accept()
 
     def _get_resize_handle(self, pos):
         if not self.selection_item:
@@ -243,10 +246,10 @@ class PageGraphicsView(QGraphicsView):
             self._start_pos = None
             self._original_rect = None
 
-    def setSelection(self, rect):
+    def setSelection(self, rect, notify=True):
         if not rect or rect.isNull() or not rect.isValid():
             if self.selection_item:
-                self.clearSelection()
+                self.clearSelection(notify=notify)
             return
 
         if self.selection_item and self.selection_item.rect() == rect:
@@ -257,13 +260,15 @@ class PageGraphicsView(QGraphicsView):
             self.selection_item = self.scene.addRect(rect, pen)
         else:
             self.selection_item.setRect(rect)
-        self.selectionChanged.emit(rect)
+        if notify:
+            self.selectionChanged.emit(rect)
 
-    def clearSelection(self):
+    def clearSelection(self, notify=True):
         if self.selection_item:
             self.scene.removeItem(self.selection_item)
             self.selection_item = None
-            self.selectionChanged.emit(QRectF())
+            if notify:
+                self.selectionChanged.emit(QRectF())
 
     def getSelectionRect(self):
         return self.selection_item.rect() if self.selection_item else None
@@ -288,9 +293,18 @@ class ThumbnailWidget(QWidget):
         self._selected_for_preview = False
         self.checkbox.clicked.connect(self._request_selection)
 
-        # Create thumbnail
         self.label = QLabel()
-        if image:
+        self.setImage(image)
+        self.label.installEventFilter(self)
+
+        layout.addWidget(self.checkbox)
+        layout.addWidget(self.label)
+        layout.addWidget(QLabel(f"Page {page_num + 1}"))
+        self.setLayout(layout)
+
+    def setImage(self, image):
+        """Replace the thumbnail without rebuilding the sidebar widget."""
+        if image is not None and not image.isNull():
             thumbnail = image.scaled(
                 QSize(80, 120),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -302,12 +316,6 @@ class ThumbnailWidget(QWidget):
             placeholder = QPixmap(80, 120)
             placeholder.fill(Qt.GlobalColor.lightGray)
             self.label.setPixmap(placeholder)
-        self.label.installEventFilter(self)
-
-        layout.addWidget(self.checkbox)
-        layout.addWidget(self.label)
-        layout.addWidget(QLabel(f"Page {page_num + 1}"))
-        self.setLayout(layout)
 
     def eventFilter(self, source, event):
         if source == self.label and event.type() == QEvent.Type.MouseButtonPress:

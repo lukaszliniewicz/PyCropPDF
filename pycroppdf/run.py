@@ -1,7 +1,7 @@
 import argparse
+import multiprocessing
 import os
 import sys
-import multiprocessing
 
 from PyQt6.QtWidgets import QApplication
 

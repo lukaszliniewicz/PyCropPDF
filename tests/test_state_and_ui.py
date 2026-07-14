@@ -82,7 +82,7 @@ class StateHelpersTests(unittest.TestCase):
 
             worker.run()
 
-            with open(manifest_path, "r", encoding="utf-8") as file_handle:
+            with open(manifest_path, encoding="utf-8") as file_handle:
                 manifest = json.load(file_handle)
             self.assertEqual(manifest["deleted_original_pages"], [2])
             self.assertEqual(

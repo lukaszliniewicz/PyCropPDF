@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from pycroppdf.main_window import PDFViewer
 from pycroppdf.provenance import sha256_bytes
-from pycroppdf.workers import SaveWorker, scene_rect_to_pdf_coords
+from pycroppdf.workers import RenderAllPagesWorker, SaveWorker, scene_rect_to_pdf_coords
 
 
 class CoordinateRegressionTests(unittest.TestCase):
@@ -160,6 +160,37 @@ class SaveAndProvenanceRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["redactions"][0]["output_page"], 1)
 
 
+class RenderingRegressionTests(unittest.TestCase):
+    def test_render_worker_can_limit_work_to_selected_pages(self):
+        document = fitz.open()
+        for page_number in range(3):
+            page = document.new_page(width=200, height=300)
+            page.insert_text((30, 30), f"Page {page_number + 1}")
+        pdf_bytes = document.tobytes()
+        document.close()
+
+        results = []
+        worker = RenderAllPagesWorker(pdf_bytes, 3, page_numbers=[1])
+        worker.signals.result.connect(results.append)
+        worker.run()
+
+        self.assertEqual([page_num for page_num, _image in results], [1])
+
+    def test_parallel_render_returns_each_page_once(self):
+        document = fitz.open()
+        for _ in range(3):
+            document.new_page(width=200, height=300)
+        pdf_bytes = document.tobytes()
+        document.close()
+
+        results = []
+        worker = RenderAllPagesWorker(pdf_bytes, 3)
+        worker.signals.result.connect(results.append)
+        worker.run()
+
+        self.assertEqual(sorted(page_num for page_num, _image in results), [0, 1, 2])
+
+
 class ViewerRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -192,9 +223,62 @@ class ViewerRegressionTests(unittest.TestCase):
 
         with patch.object(self.viewer, "reloadImages"):
             self.viewer.undo()
-        with patch.object(self.viewer, "reloadImages"):
+        with patch.object(self.viewer, "reloadImages") as reload_images:
             self.viewer.applyRedaction(QRectF(70, 70, 100, 60), [0])
+        reload_images.assert_called_once_with((0,))
         self.assertNotIn("SECRET", self.viewer.pdf_doc[0].get_text())
+
+    def test_odd_even_crop_positions_survive_resize_and_view_changes(self):
+        self.viewer.images = [
+            QImage(400, 600, QImage.Format.Format_RGB888),
+            QImage(400, 600, QImage.Format.Format_RGB888),
+        ]
+        self.viewer.updateOverlay()
+
+        self.viewer.odd_view.setSelection(QRectF(20, 30, 100, 200))
+        self.viewer.even_view.setSelection(QRectF(240, 50, 100, 200))
+        self.viewer.odd_view.setSelection(QRectF(40, 70, 120, 180))
+
+        odd_rect = self.viewer.odd_view.getSelectionRect()
+        even_rect = self.viewer.even_view.getSelectionRect()
+        self.assertEqual(odd_rect.topLeft(), QPointF(40, 70))
+        self.assertEqual(even_rect.topLeft(), QPointF(240, 50))
+        self.assertEqual(odd_rect.size(), even_rect.size())
+
+        self.viewer.setViewMode("all")
+        self.viewer.single_view.setSelection(QRectF(5, 10, 80, 90))
+        self.viewer.setViewMode("odd_even")
+
+        odd_rect = self.viewer.odd_view.getSelectionRect()
+        even_rect = self.viewer.even_view.getSelectionRect()
+        self.assertEqual(odd_rect.topLeft(), QPointF(40, 70))
+        self.assertEqual(even_rect.topLeft(), QPointF(240, 50))
+        self.assertEqual(odd_rect.size(), even_rect.size())
+        self.assertEqual(odd_rect.size(), QRectF(0, 0, 80, 90).size())
+
+        self.viewer.togglePagePreview(1)
+        self.assertEqual(self.viewer.single_view.getSelectionRect(), even_rect)
+        self.viewer.single_view.setSelection(QRectF(260, 60, 70, 85))
+        self.assertEqual(self.viewer.odd_view.getSelectionRect().topLeft(), QPointF(40, 70))
+        self.assertEqual(self.viewer.even_view.getSelectionRect().topLeft(), QPointF(260, 60))
+        self.assertEqual(
+            self.viewer.odd_view.getSelectionRect().size(),
+            self.viewer.even_view.getSelectionRect().size(),
+        )
+
+    def test_tool_and_menu_actions_have_icons(self):
+        controls = (
+            self.viewer.open_action,
+            self.viewer.save_action,
+            self.viewer.undo_action,
+            self.viewer.crop_tool_btn,
+            self.viewer.whiteout_btn,
+            self.viewer.redact_btn,
+            self.viewer.crop_btn,
+            self.viewer.delete_btn,
+            self.viewer.save_btn,
+        )
+        self.assertTrue(all(not control.icon().isNull() for control in controls))
 
     def test_crop_selection_preserves_existing_cropbox_and_pending_crop_preview(self):
         document = fitz.open()

@@ -20,9 +20,8 @@ class ProvenanceTests(unittest.TestCase):
                 document.new_page()
             document.save(source_path)
             document.close()
-            with open(source_path, "rb") as source:
-                with open(output_path, "wb") as output:
-                    output.write(source.read())
+            with open(source_path, "rb") as source, open(output_path, "wb") as output:
+                output.write(source.read())
 
             manifest = build_manifest(
                 source_path,
@@ -33,7 +32,7 @@ class ProvenanceTests(unittest.TestCase):
             )
             write_manifest(manifest_path, manifest)
 
-            with open(manifest_path, "r", encoding="utf-8") as file_handle:
+            with open(manifest_path, encoding="utf-8") as file_handle:
                 saved = json.load(file_handle)
             self.assertEqual(saved["page_map"][1]["original_page"], 3)
             self.assertEqual(saved["deleted_original_pages"], [2])
@@ -64,7 +63,7 @@ class ProvenanceTests(unittest.TestCase):
             )
             worker.run()
 
-            with open(manifest_path, "r", encoding="utf-8") as file_handle:
+            with open(manifest_path, encoding="utf-8") as file_handle:
                 saved = json.load(file_handle)
             self.assertEqual(saved["deleted_original_pages"], [2])
             self.assertEqual(saved["whiteouts"][0]["output_page"], 2)

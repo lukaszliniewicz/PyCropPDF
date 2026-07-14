@@ -8,7 +8,6 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-
 SCHEMA_VERSION = 2
 
 

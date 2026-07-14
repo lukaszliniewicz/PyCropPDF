@@ -5,6 +5,7 @@ Please use 'run.py' instead.
 """
 
 import warnings
+
 from run import main
 
 if __name__ == "__main__":

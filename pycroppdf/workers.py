@@ -6,7 +6,8 @@ import concurrent.futures
 import os
 import tempfile
 import traceback
-from typing import Iterable
+from collections.abc import Iterable
+from contextlib import suppress
 
 import fitz
 from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
@@ -14,10 +15,11 @@ from PyQt6.QtGui import QImage
 
 from .provenance import build_manifest, sha256_file, write_manifest
 
-
 MAX_RENDER_WORKERS = 4
+LOCAL_RENDER_PAGE_LIMIT = 2
 _RENDER_PDF_BYTES: bytes | None = None
 _RENDER_CROP_RECTS: dict[int, tuple[float, float, float, float]] = {}
+_RENDER_DOCUMENT: fitz.Document | None = None
 
 
 class WorkerSignals(QObject):
@@ -114,41 +116,61 @@ def _initialise_render_process(
     crop_rects: dict[int, tuple[float, float, float, float]],
 ) -> None:
     """Store the immutable render inputs once per process."""
-    global _RENDER_PDF_BYTES, _RENDER_CROP_RECTS
+    global _RENDER_PDF_BYTES, _RENDER_CROP_RECTS, _RENDER_DOCUMENT
     _RENDER_PDF_BYTES = pdf_bytes
     _RENDER_CROP_RECTS = crop_rects
+    _RENDER_DOCUMENT = fitz.open("pdf", pdf_bytes)
+
+
+def _render_page_from_document(
+    document: fitz.Document,
+    page_num: int,
+    crop_rects: dict[int, tuple[float, float, float, float]],
+):
+    page = document[page_num]
+    clip_rect = None
+    crop_rect = crop_rects.get(page_num)
+    if crop_rect:
+        clip_rect = fitz.Rect(crop_rect)
+        clip_rect.intersect(page.cropbox)
+        _validate_rect(clip_rect, f"Crop rectangle for page {page_num + 1}")
+
+    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=clip_rect)
+    return page_num, pix.samples, pix.width, pix.height, pix.stride
 
 
 def _render_page_task(page_num: int):
     """Render one page using the process-local PDF source."""
-    if _RENDER_PDF_BYTES is None:
+    if _RENDER_PDF_BYTES is None or _RENDER_DOCUMENT is None:
         raise RuntimeError("Render process was not initialized.")
+    return _render_page_from_document(_RENDER_DOCUMENT, page_num, _RENDER_CROP_RECTS)
 
-    pdf_doc = fitz.open("pdf", _RENDER_PDF_BYTES)
-    try:
-        page = pdf_doc[page_num]
-        clip_rect = None
-        crop_rect = _RENDER_CROP_RECTS.get(page_num)
-        if crop_rect:
-            clip_rect = fitz.Rect(crop_rect)
-            clip_rect.intersect(page.cropbox)
-            _validate_rect(clip_rect, f"Crop rectangle for page {page_num + 1}")
 
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=clip_rect)
-        return page_num, pix.samples, pix.width, pix.height, pix.stride
-    finally:
-        pdf_doc.close()
+def _image_from_render_result(result):
+    page_num, samples, width, height, stride = result
+    image = QImage(samples, width, height, stride, QImage.Format.Format_RGB888).copy()
+    return page_num, image
 
 
 class RenderAllPagesWorker(QRunnable):
     """Render all previews with a bounded pool of PDF rendering processes."""
 
-    def __init__(self, pdf_bytes: bytes, num_pages: int, crop_info: dict | None = None):
+    def __init__(
+        self,
+        pdf_bytes: bytes,
+        num_pages: int,
+        crop_info: dict | None = None,
+        page_numbers: Iterable[int] | None = None,
+    ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.num_pages = num_pages
         self.crop_info = crop_info or {}
+        requested_pages = range(num_pages) if page_numbers is None else page_numbers
+        self.page_numbers = tuple(sorted({int(page_num) for page_num in requested_pages}))
+        if any(page_num < 0 or page_num >= num_pages for page_num in self.page_numbers):
+            raise ValueError("A requested preview page is outside the document.")
 
     def run(self) -> None:
         try:
@@ -157,20 +179,32 @@ class RenderAllPagesWorker(QRunnable):
                 for page_num, rect in self.crop_info.get("rects", {}).items()
                 if rect
             }
+            if not self.page_numbers:
+                return
+
+            if len(self.page_numbers) <= LOCAL_RENDER_PAGE_LIMIT:
+                document = fitz.open("pdf", self.pdf_bytes)
+                try:
+                    for page_num in self.page_numbers:
+                        result = _render_page_from_document(document, page_num, crop_rects)
+                        self.signals.result.emit(_image_from_render_result(result))
+                finally:
+                    document.close()
+                return
+
             process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
             cpu_count = process_cpu_count() or 1
-            max_workers = min(self.num_pages, MAX_RENDER_WORKERS, max(1, cpu_count - 1))
+            max_workers = min(len(self.page_numbers), MAX_RENDER_WORKERS, max(1, cpu_count - 1))
             with concurrent.futures.ProcessPoolExecutor(
                 max_workers=max_workers,
                 initializer=_initialise_render_process,
                 initargs=(self.pdf_bytes, crop_rects),
             ) as executor:
-                for page_num, samples, width, height, stride in executor.map(
-                    _render_page_task,
-                    range(self.num_pages),
-                ):
-                    image = QImage(samples, width, height, stride, QImage.Format.Format_RGB888)
-                    self.signals.result.emit((page_num, image))
+                futures = [
+                    executor.submit(_render_page_task, page_num) for page_num in self.page_numbers
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    self.signals.result.emit(_image_from_render_result(future.result()))
         except Exception:
             self.signals.error.emit(traceback.format_exc())
         finally:
@@ -330,8 +364,6 @@ class SaveWorker(QRunnable):
                 document.close()
             for temporary_path in (pdf_temporary_path, manifest_temporary_path):
                 if temporary_path and os.path.exists(temporary_path):
-                    try:
+                    with suppress(OSError):
                         os.remove(temporary_path)
-                    except OSError:
-                        pass
             self.signals.finished.emit()
