@@ -245,6 +245,15 @@ class PDFViewer(QMainWindow):
         self.open_action.triggered.connect(self.openPDF)
         file_menu.addAction(self.open_action)
 
+        self.reload_original_action = QAction("&Reload Original", self)
+        self.reload_original_action.setIcon(vector_icon("reset"))
+        self.reload_original_action.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        self.reload_original_action.setToolTip(
+            "Discard edits and reload the originally opened PDF from disk."
+        )
+        self.reload_original_action.triggered.connect(self.reloadOriginal)
+        file_menu.addAction(self.reload_original_action)
+
         self.save_action = QAction("&Save PDF...", self)
         self.save_action.setIcon(vector_icon("save"))
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
@@ -362,6 +371,14 @@ class PDFViewer(QMainWindow):
         self.undo_btn.clicked.connect(self.undo)
         self.undo_btn.setEnabled(False)
         toolbar.addWidget(self.undo_btn)
+
+        self.reload_original_btn = QPushButton("Reload")
+        self.reload_original_btn.setIcon(vector_icon("reset"))
+        self.reload_original_btn.setToolTip(
+            "Discard edits and reload the originally opened PDF from disk."
+        )
+        self.reload_original_btn.clicked.connect(self.reloadOriginal)
+        toolbar.addWidget(self.reload_original_btn)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -545,6 +562,7 @@ class PDFViewer(QMainWindow):
             self.view_stack_btn,
             self.delete_btn,
             self.undo_btn,
+            self.reload_original_btn,
             self.save_btn,
             self.crop_btn,
             self.reset_crop_btn,
@@ -611,14 +629,17 @@ class PDFViewer(QMainWindow):
         self.odd_view_pixmap_cache = None
         self.even_view_pixmap_cache = None
 
-    def _refresh_dirty_state(self):
-        """Derive whether the loaded document has unexported edits."""
-        self.is_dirty = bool(
+    def _has_document_edits(self):
+        return bool(
             self.active_crop_info
             or self.rotation_operations
             or self.cover_operations
             or self.page_map != list(range(self.original_page_count))
         )
+
+    def _refresh_dirty_state(self):
+        """Derive whether the loaded document has unexported edits."""
+        self.is_dirty = self._has_document_edits()
 
     def _confirm_discard_changes(self) -> bool:
         if not self.is_dirty:
@@ -646,19 +667,6 @@ class PDFViewer(QMainWindow):
         self.reloadImages(affected_pages)
 
     def setActiveTool(self, tool):
-        if tool in {"cover", "rotate"} and self.active_crop_info:
-            message = (
-                "A cover cannot be positioned reliably on an active cropped preview."
-                if tool == "cover"
-                else "Rotation cannot be applied reliably on an active cropped preview."
-            )
-            QMessageBox.warning(
-                self,
-                "Reset Crop First",
-                f"{message} Reset the crop, make the change, then crop again.",
-            )
-            tool = "crop"
-
         self.active_tool = tool if tool in {"crop", "cover", "rotate"} else "crop"
         self.crop_tool_btn.setChecked(self.active_tool == "crop")
         self.cover_tool_btn.setChecked(self.active_tool == "cover")
@@ -673,10 +681,10 @@ class PDFViewer(QMainWindow):
         if self.active_tool == "cover":
             self._showCoverScopeStatus()
         elif self.active_tool == "rotate":
-            self.statusBar().showMessage(
-                "Rotate selected. Choose the target pages and rotation.",
-                6000,
-            )
+            message = "Rotate selected. Choose the target pages and rotation."
+            if self.active_crop_info:
+                message += " The active crop will follow the rotated pages."
+            self.statusBar().showMessage(message, 6000)
         else:
             self.statusBar().showMessage(
                 "Crop Box tool selected. Draw a box, then click Apply Crop.",
@@ -711,7 +719,7 @@ class PDFViewer(QMainWindow):
             f"Cover color set to RGB({color.red()}, {color.green()}, {color.blue()}).",
             6000,
         )
-        self.setActiveTool("cover" if not self.active_crop_info else "crop")
+        self.setActiveTool("cover")
 
     def eventFilter(self, watched, event):
         if (
@@ -900,10 +908,10 @@ class PDFViewer(QMainWindow):
             self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
             return
         target = self._cover_target_description(target_pages)
-        self.statusBar().showMessage(
-            f"Cover target: {target}. Draw a rectangle; existing covers remain.",
-            6000,
-        )
+        message = f"Cover target: {target}. Draw a rectangle; existing covers remain."
+        if self.active_crop_info:
+            message += " The active crop remains applied."
+        self.statusBar().showMessage(message, 6000)
 
     def _per_page_rotation_override_enabled(self):
         return (
@@ -1105,11 +1113,11 @@ class PDFViewer(QMainWindow):
 <ol>
 <li>Open a PDF using <b>File > Open PDF...</b> or by dragging it into the window.</li>
 <li>Click <b>Crop</b> to open its controls. Draw crop boxes in the stack view. Odd/even positions stay independent while their sizes stay uniform. In a page preview, enable <b>This page only</b> to make that page differ.</li>
-<li>Click <b>Cover</b>, choose <b>All</b>, <b>Odd</b>, or <b>Even</b>, then draw a visual cover. In a page preview, <b>This page only</b> overrides that scope. New covers are added without replacing existing ones, and they do not remove the underlying PDF content.</li>
-<li>Open <b>Rotate</b>, enter a fine angle, and click <b>Preview</b> when you want to inspect it. <b>Discard</b> clears the pending preview; <b>Apply</b> changes the PDF. The rotation toolbar's <b>This page only</b> option limits rotation to the previewed page.</li>
+<li>Click <b>Cover</b>, choose <b>All</b>, <b>Odd</b>, or <b>Even</b>, then draw a visual cover. In a page preview, <b>This page only</b> overrides that scope. Cover works within an active crop and before or after applied rotation. New covers are added without replacing existing ones, and they do not remove the underlying PDF content.</li>
+<li>Open <b>Rotate</b>, enter a fine angle, and click <b>Preview</b> when you want to inspect it. <b>Discard</b> clears the pending preview; <b>Apply</b> changes the PDF. The rotation toolbar's <b>This page only</b> option limits rotation to the previewed page. An active crop follows rotated pages and remains editable afterward.</li>
 <li>Click a thumbnail image to preview it; click it again or use <b>Stack</b> to return. Thumbnail checkboxes select pages for deletion. Ctrl toggles pages and Shift selects a range.</li>
 <li>Crop applies to all pages; explicit crop overrides replace the stack crop only on their pages. Cover uses its explicit page scope and remains additive.</li>
-<li>Use <b>Undo</b> to restore the previous crop, cover, rotation, or page deletion.</li>
+<li>Use <b>Undo</b> to restore the previous edit, or <b>Reload</b> to discard all edits and reopen the original PDF.</li>
 <li>Save your changes with the purple <b>Save</b> button.</li>
 </ol>"""
         QMessageBox.information(self, "About PyCropPDF", help_text)
@@ -1190,13 +1198,6 @@ class PDFViewer(QMainWindow):
     def previewRotation(self, *_args):
         if self.is_processing or self.pdf_doc is None:
             return
-        if self.active_crop_info:
-            QMessageBox.warning(
-                self,
-                "Reset Crop First",
-                "Reset the active crop before previewing rotation so coordinates remain valid.",
-            )
-            return
         angle = normalize_angle(self.rotation_angle_spin.value())
         targets = self._rotation_target_pages()
         if abs(angle) < 0.01 or not targets:
@@ -1266,13 +1267,6 @@ class PDFViewer(QMainWindow):
     def applyRotation(self, clockwise_degrees):
         if self.is_processing or self.pdf_doc is None:
             return
-        if self.active_crop_info:
-            QMessageBox.warning(
-                self,
-                "Reset Crop First",
-                "Reset the active crop before rotating pages so crop coordinates remain valid.",
-            )
-            return
 
         clockwise_degrees = normalize_angle(clockwise_degrees)
         if abs(clockwise_degrees) < 0.01:
@@ -1294,7 +1288,8 @@ class PDFViewer(QMainWindow):
             return
 
         rotations = dict.fromkeys(target_pages, clockwise_degrees)
-        worker = RotatePagesWorker(self.pdf_doc.tobytes(), rotations)
+        crop_rects = self.active_crop_info.get("rects", {}) if self.active_crop_info else {}
+        worker = RotatePagesWorker(self.pdf_doc.tobytes(), rotations, crop_rects)
         self._start_rotation_worker(
             worker,
             f"Rotating {len(target_pages)} page{'s' if len(target_pages) != 1 else ''}...",
@@ -1302,13 +1297,6 @@ class PDFViewer(QMainWindow):
 
     def autoDeskew(self):
         if self.is_processing or self.pdf_doc is None:
-            return
-        if self.active_crop_info:
-            QMessageBox.warning(
-                self,
-                "Reset Crop First",
-                "Reset the active crop before deskewing pages so crop coordinates remain valid.",
-            )
             return
         if not deskew_available():
             QMessageBox.information(
@@ -1334,6 +1322,7 @@ class PDFViewer(QMainWindow):
             self.pdf_doc.tobytes(),
             target_pages,
             max_workers=worker_count,
+            crop_rects=(self.active_crop_info.get("rects", {}) if self.active_crop_info else {}),
         )
         worker_suffix = f" using {worker_count} workers" if worker_count > 1 else ""
         self._start_rotation_worker(
@@ -1359,23 +1348,44 @@ class PDFViewer(QMainWindow):
             self.updateActionState()
             return
 
+        new_document = None
         try:
             new_document = fitz.open("pdf", result["pdf_bytes"])
-            old_document = self.pdf_doc
-            self.pdf_doc = new_document
-            if old_document is not None:
-                old_document.close()
+            new_crop_info = clone_crop_info(self.active_crop_info)
+            transformed_crop_rects = result.get("crop_rects", {})
+            if new_crop_info and transformed_crop_rects:
+                for raw_page_num, raw_rect in transformed_crop_rects.items():
+                    page_num = int(raw_page_num)
+                    if page_num not in rotations or not 0 <= page_num < len(new_document):
+                        raise ValueError("Rotation returned crop data for an unexpected page.")
+                    crop_rect = fitz.Rect(raw_rect)
+                    crop_rect.intersect(new_document[page_num].cropbox)
+                    if crop_rect.is_empty:
+                        raise ValueError(
+                            f"Rotation moved the crop for page {page_num + 1} outside the page."
+                        )
+                    new_crop_info["rects"][page_num] = rect_to_tuple(crop_rect)
 
+            new_rotation_operations = list(self.rotation_operations)
             for page_num, angle in rotations.items():
                 original_page = (
                     self.page_map[page_num] if page_num < len(self.page_map) else page_num
                 )
-                self.rotation_operations.append(
+                new_rotation_operations.append(
                     {
                         "original_page": original_page + 1,
                         "angle": round(float(angle), 3),
                     }
                 )
+
+            old_document = self.pdf_doc
+            self.pdf_doc = new_document
+            new_document = None
+            self.active_crop_info = new_crop_info
+            self.rotation_operations = new_rotation_operations
+            if old_document is not None:
+                old_document.close()
+
             self._refresh_dirty_state()
             self._rotation_undo_pushed = False
             with QSignalBlocker(self.rotation_angle_spin):
@@ -1388,6 +1398,8 @@ class PDFViewer(QMainWindow):
             self.clearAllSelections()
             self._reload_after_processing = True
             message = f"Rotated {len(rotations)} page{'s' if len(rotations) != 1 else ''}."
+            if transformed_crop_rects:
+                message += " Active crop preserved."
             if undetected:
                 message += (
                     f" No angle was detected on {len(undetected)} page"
@@ -1395,6 +1407,8 @@ class PDFViewer(QMainWindow):
                 )
             self.pending_status_message = message
         except Exception as error:
+            if new_document is not None:
+                new_document.close()
             self.rotationError(operation_id, str(error))
 
     def rotationError(self, operation_id, error_str):
@@ -1419,6 +1433,26 @@ class PDFViewer(QMainWindow):
         fileName, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if fileName:
             self.loadPDF(fileName)
+
+    def reloadOriginal(self):
+        if self.is_processing:
+            return False
+        if self.pdf_doc is None or not self.original_pdf_path:
+            QMessageBox.information(self, "No PDF", "Open a PDF before reloading the original.")
+            return False
+
+        if self._has_document_edits():
+            response = QMessageBox.question(
+                self,
+                "Reload original PDF?",
+                "Discard all edits and reload the originally opened PDF from disk?",
+                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if response != QMessageBox.StandardButton.Discard:
+                return False
+
+        return self.loadPDF(self.original_pdf_path, confirm_discard=False)
 
     def loadPDF(self, pdf_path, confirm_discard=True):
         if self.is_processing:
@@ -1563,6 +1597,7 @@ class PDFViewer(QMainWindow):
             thumbnail_pages = None if self._render_was_full else self._render_target_pages
             self.updateThumbnails(thumbnail_pages)
             self.updateOverlay()
+            self._restore_active_crop_selections()
 
     @staticmethod
     def _selection_copy(view):
@@ -1650,6 +1685,51 @@ class PDFViewer(QMainWindow):
             self.odd_view.show()
             self.even_view.show()
             self.updateSplitViewOverlay()
+
+    def _restore_active_crop_selections(self):
+        """Restore the applied crop outline after refreshed page geometry is rendered."""
+        if self.pdf_doc is None or not self.active_crop_info or not self.images:
+            return
+
+        crop_rects = self.active_crop_info.get("rects", {})
+        if not crop_rects:
+            return
+
+        def scene_rect(page_num, canvas_dims):
+            if not (0 <= page_num < len(self.images)) or self.images[page_num] is None:
+                return None
+            crop_rect = crop_rects.get(page_num)
+            if crop_rect is None:
+                return None
+            return self._pdf_rect_to_scene_rect(crop_rect, page_num, canvas_dims)
+
+        try:
+            if self.preview_page_num is not None:
+                selection = scene_rect(
+                    self.preview_page_num,
+                    self._page_canvas_dimensions(self.preview_page_num),
+                )
+                if selection:
+                    self.single_view.setSelection(selection, notify=False)
+                return
+
+            stack_canvas = self._stack_canvas_dimensions()
+            if self.view_mode == "all":
+                for page_num in sorted(crop_rects):
+                    selection = scene_rect(int(page_num), stack_canvas)
+                    if selection:
+                        self.single_view.setSelection(selection, notify=False)
+                        break
+                return
+
+            for parity, view in ((0, self.odd_view), (1, self.even_view)):
+                for page_num in range(parity, len(self.images), 2):
+                    selection = scene_rect(page_num, stack_canvas)
+                    if selection:
+                        view.setSelection(selection, notify=False)
+                        break
+        except (IndexError, ValueError):
+            LOGGER.warning("Could not restore the active crop outline.", exc_info=True)
 
     def updateSingleViewOverlay(self):
         if not self.images:
@@ -2123,15 +2203,6 @@ class PDFViewer(QMainWindow):
         if self.is_processing or self.pdf_doc is None:
             return
 
-        if self.active_crop_info:
-            QMessageBox.warning(
-                self,
-                "Reset Crop First",
-                "A cover cannot be positioned reliably on an active cropped preview. "
-                "Please reset the crop first.",
-            )
-            return
-
         target_pages = self._target_pages_for_rectangle_request()
         if not target_pages:
             self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
@@ -2377,7 +2448,7 @@ class PDFViewer(QMainWindow):
         available = has_document and not self.is_processing
         coordinate_tools_available = available and abs(self._rotation_preview_angle) < 0.01
         self.crop_tool_btn.setEnabled(coordinate_tools_available)
-        cover_available = coordinate_tools_available and not self.active_crop_info
+        cover_available = coordinate_tools_available
         self.cover_tool_btn.setEnabled(cover_available)
         self.cover_color_btn.setEnabled(cover_available)
         self.pick_cover_color_btn.setEnabled(cover_available)
@@ -2389,7 +2460,7 @@ class PDFViewer(QMainWindow):
         )
         self.crop_btn.setEnabled(coordinate_tools_available and self.active_tool == "crop")
         self.reset_crop_btn.setEnabled(available and bool(self.active_crop_info))
-        rotation_available = available and not self.active_crop_info
+        rotation_available = available
         self.crop_page_override_checkbox.setEnabled(
             coordinate_tools_available and self.preview_page_num is not None
         )
@@ -2424,6 +2495,8 @@ class PDFViewer(QMainWindow):
         self.rotation_options_toggle_btn.setEnabled(rotation_available)
         self.undo_btn.setEnabled(available and bool(self.undo_stack))
         self.undo_action.setEnabled(available and bool(self.undo_stack))
+        self.reload_original_btn.setEnabled(available)
+        self.reload_original_action.setEnabled(available)
         self.save_btn.setEnabled(available)
         self.save_action.setEnabled(available)
 

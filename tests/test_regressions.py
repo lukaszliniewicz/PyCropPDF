@@ -309,6 +309,68 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertLess(blue, 70)
         self.assertEqual(self.viewer.cover_operations[-1]["color"], [0.9216, 0.2745, 0.1765])
 
+    def test_cover_works_inside_a_crop_on_a_rotated_page_and_undo_preserves_crop(self):
+        document = fitz.open()
+        page = document.new_page(width=400, height=600)
+        page.set_rotation(90)
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0]
+        self.viewer.original_page_count = 1
+        self.viewer.images = [QImage(450, 300, QImage.Format.Format_RGB888)]
+        crop_rect = (50.0, 60.0, 350.0, 510.0)
+        self.viewer.active_crop_info = {
+            "view_mode": "all",
+            "rects": {0: crop_rect},
+            "image_dims": [(450, 300)],
+        }
+        self.viewer.setViewMode("all")
+        self.viewer._refresh_dirty_state()
+        self.viewer.updateActionState()
+
+        self.assertTrue(self.viewer.cover_tool_btn.isEnabled())
+        self.viewer.rotation_angle_spin.setValue(5.0)
+        self.viewer.previewRotation()
+        self.assertFalse(self.viewer.cover_tool_btn.isEnabled())
+        self.viewer.discardRotationPreview()
+        self.assertTrue(self.viewer.cover_tool_btn.isEnabled())
+
+        with patch.object(QMessageBox, "warning") as warning:
+            self.viewer.cover_tool_btn.click()
+        warning.assert_not_called()
+        self.assertEqual(self.viewer.active_tool, "cover")
+        self.assertIn("active crop remains applied", self.viewer.statusBar().currentMessage())
+
+        scene_rect = QRectF(45, 30, 90, 60)
+        expected_pdf_rect = self.viewer._scene_rect_to_pdf_rect(scene_rect, 0)
+        self.viewer.cover_color = (0.0, 0.0, 0.0)
+        with patch.object(self.viewer, "reloadImages"):
+            self.viewer.handleCoverRequest(scene_rect)
+
+        self.assertEqual(self.viewer.active_crop_info["rects"][0], crop_rect)
+        self.assertEqual(len(self.viewer.cover_operations), 1)
+        operation_rect = fitz.Rect(self.viewer.cover_operations[0]["rect"])
+        for actual, expected in zip(operation_rect, expected_pdf_rect, strict=True):
+            self.assertAlmostEqual(actual, expected, places=3)
+        restored_scene_rect = self.viewer._pdf_rect_to_scene_rect(operation_rect, 0)
+        for actual, expected in zip(
+            (
+                restored_scene_rect.x(),
+                restored_scene_rect.y(),
+                restored_scene_rect.width(),
+                restored_scene_rect.height(),
+            ),
+            (scene_rect.x(), scene_rect.y(), scene_rect.width(), scene_rect.height()),
+            strict=True,
+        ):
+            self.assertAlmostEqual(actual, expected, places=3)
+        self.assertTrue(self.viewer.pdf_doc[0].get_drawings())
+
+        with patch.object(self.viewer, "reloadImages"):
+            self.viewer.undo()
+        self.assertEqual(self.viewer.active_crop_info["rects"][0], crop_rect)
+        self.assertEqual(self.viewer.cover_operations, [])
+        self.assertEqual(self.viewer.pdf_doc[0].get_drawings(), [])
+
     def test_stack_crop_maps_to_page_preview_and_back_after_deletion(self):
         document = fitz.open()
         for width, height in ((400, 600), (300, 500), (200, 400)):
@@ -478,6 +540,7 @@ class ViewerRegressionTests(unittest.TestCase):
     def test_actions_use_custom_icons_and_auto_deskew_label(self):
         controls = (
             self.viewer.open_action,
+            self.viewer.reload_original_action,
             self.viewer.save_action,
             self.viewer.undo_action,
             self.viewer.crop_tool_btn,
@@ -487,6 +550,7 @@ class ViewerRegressionTests(unittest.TestCase):
             self.viewer.preview_rotation_btn,
             self.viewer.discard_rotation_preview_btn,
             self.viewer.delete_btn,
+            self.viewer.reload_original_btn,
             self.viewer.save_btn,
         )
         self.assertTrue(all(not control.icon().isNull() for control in controls))
@@ -594,6 +658,62 @@ class ViewerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(sum(not toolbar.isHidden() for toolbar in toolbars), 1)
 
+    def test_rotation_toolbar_and_preview_remain_available_with_an_active_crop(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(300, 450, QImage.Format.Format_RGB888)]
+        self.viewer.active_crop_info = {
+            "view_mode": "all",
+            "rects": {0: (50.0, 60.0, 350.0, 510.0)},
+            "image_dims": [(400, 600)],
+        }
+        self.viewer.updateActionState()
+
+        self.assertTrue(self.viewer.rotation_options_toggle_btn.isEnabled())
+        with patch.object(QMessageBox, "warning") as warning:
+            self.viewer.rotation_options_toggle_btn.click()
+        warning.assert_not_called()
+        self.assertEqual(self.viewer.active_tool, "rotate")
+        self.assertFalse(self.viewer.rotation_toolbar.isHidden())
+        self.assertTrue(self.viewer.rotate_left_btn.isEnabled())
+
+        self.viewer.rotation_angle_spin.setValue(3.0)
+        self.assertTrue(self.viewer.preview_rotation_btn.isEnabled())
+        self.viewer.preview_rotation_btn.click()
+        self.assertEqual(self.viewer._rotation_preview_angle, 3.0)
+        self.assertIsNotNone(self.viewer.active_crop_info)
+
+    def test_invalid_rotated_crop_result_does_not_replace_the_document(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0]
+        self.viewer.original_page_count = 1
+        self.viewer.active_crop_info = {
+            "view_mode": "all",
+            "rects": {0: (50.0, 60.0, 350.0, 510.0)},
+            "image_dims": [(400, 600)],
+        }
+        self.viewer.pushUndo()
+        self.viewer._rotation_undo_pushed = True
+        self.viewer._operation_id = 1
+
+        with patch.object(QMessageBox, "critical"):
+            self.viewer.rotationFinished(
+                1,
+                {
+                    "pdf_bytes": document.tobytes(),
+                    "rotation_deltas": {0: 3.0},
+                    "crop_rects": {1: (10.0, 10.0, 20.0, 20.0)},
+                },
+            )
+
+        self.assertIs(self.viewer.pdf_doc, document)
+        self.assertFalse(document.is_closed)
+        self.assertEqual(self.viewer.rotation_operations, [])
+        self.assertEqual(self.viewer.undo_stack, [])
+
     def test_page_only_controls_use_consistent_label(self):
         controls = (
             self.viewer.crop_page_override_checkbox,
@@ -617,6 +737,7 @@ class ViewerRegressionTests(unittest.TestCase):
             self.viewer.view_stack_btn,
             self.viewer.delete_btn,
             self.viewer.undo_btn,
+            self.viewer.reload_original_btn,
             self.viewer.save_btn,
             self.viewer.crop_btn,
             self.viewer.reset_crop_btn,
@@ -712,6 +833,44 @@ class ViewerRegressionTests(unittest.TestCase):
             self.assertTrue(self.viewer.save_btn.isEnabled())
             self.viewer.pdf_doc = None
             current_document.close()
+
+    def test_reload_original_discards_edits_and_resets_document_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = os.path.join(directory, "source.pdf")
+            document = fitz.open()
+            document.new_page().insert_text((72, 72), "ORIGINAL")
+            document.save(source_path)
+            document.close()
+
+            with patch.object(self.viewer, "reloadImages"):
+                self.assertTrue(self.viewer.loadPDF(source_path))
+            self.viewer.pdf_doc[0].insert_text((72, 100), "SESSION EDIT")
+            self.viewer.active_crop_info = {
+                "view_mode": "all",
+                "rects": {0: (20.0, 20.0, 500.0, 700.0)},
+                "image_dims": [(600, 800)],
+            }
+            self.viewer.rotation_operations = [{"original_page": 1, "angle": 2.0}]
+            self.viewer._refresh_dirty_state()
+
+            with (
+                patch.object(
+                    QMessageBox,
+                    "question",
+                    return_value=QMessageBox.StandardButton.Discard,
+                ) as question,
+                patch.object(self.viewer, "reloadImages"),
+            ):
+                self.assertTrue(self.viewer.reloadOriginal())
+
+            question.assert_called_once()
+            self.assertIn("ORIGINAL", self.viewer.pdf_doc[0].get_text())
+            self.assertNotIn("SESSION EDIT", self.viewer.pdf_doc[0].get_text())
+            self.assertIsNone(self.viewer.active_crop_info)
+            self.assertEqual(self.viewer.rotation_operations, [])
+            self.assertEqual(self.viewer.cover_operations, [])
+            self.assertEqual(self.viewer.page_map, [0])
+            self.assertFalse(self.viewer.is_dirty)
 
     def test_drop_is_rejected_while_an_operation_is_running(self):
         self.viewer.is_processing = True

@@ -246,6 +246,75 @@ class ViewerInteractionTests(unittest.TestCase):
             self.assertEqual(self.viewer.cover_operations, [])
             self.assertIsNone(QApplication.overrideCursor())
 
+    def test_fine_rotation_preserves_scoped_crops_and_undo_restores_them(self):
+        document = fitz.open()
+        for page_number in range(3):
+            page = document.new_page(width=300, height=400)
+            page.insert_text((40, 40), f"Page {page_number + 1}")
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0, 1, 2]
+        self.viewer.original_page_count = 3
+        self.viewer.images = [QImage(240, 320, QImage.Format.Format_RGB888) for _ in range(3)]
+        original_rects = {
+            0: (30.0, 40.0, 250.0, 350.0),
+            1: (35.0, 45.0, 255.0, 355.0),
+            2: (40.0, 50.0, 260.0, 360.0),
+        }
+        self.viewer.active_crop_info = {
+            "view_mode": "all",
+            "rects": dict(original_rects),
+            "image_dims": [(300, 400)] * 3,
+        }
+        self.viewer.rotation_scope_combo.setCurrentIndex(
+            self.viewer.rotation_scope_combo.findData("odd")
+        )
+
+        self.viewer.applyRotation(3.0)
+        self._wait_for_processing()
+
+        rotated_rects = self.viewer.active_crop_info["rects"]
+        self.assertNotEqual(rotated_rects[0], original_rects[0])
+        self.assertEqual(rotated_rects[1], original_rects[1])
+        self.assertNotEqual(rotated_rects[2], original_rects[2])
+        self.assertGreater(
+            fitz.Rect(rotated_rects[0]).width,
+            fitz.Rect(original_rects[0]).width,
+        )
+        self.assertGreater(
+            fitz.Rect(rotated_rects[0]).height,
+            fitz.Rect(original_rects[0]).height,
+        )
+        self.assertAlmostEqual(
+            fitz.Rect(rotated_rects[0]).width,
+            fitz.Rect(rotated_rects[2]).width,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            fitz.Rect(rotated_rects[0]).height,
+            fitz.Rect(rotated_rects[2]).height,
+            places=3,
+        )
+        self.assertTrue(self.viewer.pdf_doc[0].cropbox.contains(fitz.Rect(rotated_rects[0])))
+        self.assertTrue(self.viewer.pdf_doc[2].cropbox.contains(fitz.Rect(rotated_rects[2])))
+        self.assertIsNotNone(self.viewer.odd_view.getSelectionRect())
+        self.assertIsNotNone(self.viewer.even_view.getSelectionRect())
+        restored_crop = self.viewer._scene_rect_to_pdf_rect(
+            self.viewer.odd_view.getSelectionRect(),
+            0,
+            self.viewer._stack_canvas_dimensions(),
+        )
+        for actual, expected in zip(restored_crop, rotated_rects[0], strict=True):
+            self.assertAlmostEqual(actual, expected, places=3)
+        self.assertIn("Active crop preserved", self.viewer.statusBar().currentMessage())
+
+        self.viewer.undo()
+        self._wait_for_processing()
+
+        self.assertEqual(self.viewer.active_crop_info["rects"], original_rects)
+        self.assertEqual(self.viewer.rotation_operations, [])
+        self.assertEqual(self.viewer.pdf_doc[0].mediabox, fitz.Rect(0, 0, 300, 400))
+        self.assertEqual(self.viewer.pdf_doc[2].mediabox, fitz.Rect(0, 0, 300, 400))
+
     def test_cover_empty_scope_is_reported_without_starting_an_operation(self):
         document = fitz.open()
         document.new_page(width=300, height=400)

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -12,8 +13,9 @@ from pycroppdf.rotation import (
     detect_page_deskew_angle,
     recommended_deskew_workers,
     rotate_pdf_bytes,
+    transform_crop_rects_for_rotations,
 )
-from pycroppdf.workers import SaveWorker
+from pycroppdf.workers import AutoDeskewWorker, SaveWorker
 
 
 class PageRotationTests(unittest.TestCase):
@@ -61,6 +63,84 @@ class PageRotationTests(unittest.TestCase):
         self.assertIn("VECTOR TEXT", page.get_text())
         self.assertNotEqual(page.get_links()[0]["from"], original_link)
         self.assertEqual(len(list(page.annots() or ())), 1)
+        output.close()
+
+    def test_existing_vector_cover_follows_a_later_fine_rotation(self):
+        document = fitz.open()
+        page = document.new_page(width=200, height=100)
+        cover_rect = fitz.Rect(20, 20, 60, 40)
+        page.draw_rect(cover_rect, color=(0, 0, 0), fill=(0, 0, 0), width=0)
+        source_bytes = document.tobytes()
+        document.close()
+
+        output = fitz.open("pdf", rotate_pdf_bytes(source_bytes, {0: 5.0}))
+        rotated_cover = fitz.Rect(output[0].get_drawings()[0]["rect"])
+
+        self.assertNotEqual(rotated_cover, cover_rect)
+        self.assertTrue(output[0].mediabox.contains(rotated_cover))
+        self.assertGreater(rotated_cover.width, cover_rect.width)
+        self.assertGreater(rotated_cover.height, cover_rect.height)
+        output.close()
+
+    def test_pending_crop_follows_fine_rotation_and_quarter_turns_keep_pdf_coordinates(self):
+        document = fitz.open("pdf", self._source_pdf())
+        document.new_page(width=200, height=100).set_cropbox(fitz.Rect(10, 5, 190, 95))
+        source_bytes = document.tobytes()
+        document.close()
+        crop_rects = {
+            0: (30.0, 20.0, 150.0, 75.0),
+            1: (40.0, 25.0, 160.0, 80.0),
+        }
+
+        transformed = transform_crop_rects_for_rotations(
+            source_bytes,
+            crop_rects,
+            {0: 5.0, 1: 90.0},
+        )
+        output = fitz.open("pdf", rotate_pdf_bytes(source_bytes, {0: 5.0, 1: 90.0}))
+
+        self.assertNotEqual(transformed[0], crop_rects[0])
+        self.assertEqual(transformed[1], crop_rects[1])
+        angle = math.radians(5.0)
+        expected_width = 120.0 * math.cos(angle) + 55.0 * math.sin(angle)
+        expected_height = 55.0 * math.cos(angle) + 120.0 * math.sin(angle)
+        self.assertAlmostEqual(fitz.Rect(transformed[0]).width, expected_width, places=3)
+        self.assertAlmostEqual(fitz.Rect(transformed[0]).height, expected_height, places=3)
+        self.assertTrue(output[0].cropbox.contains(fitz.Rect(transformed[0])))
+        self.assertTrue(output[1].cropbox.contains(fitz.Rect(transformed[1])))
+        output.close()
+
+    def test_fine_rotation_preserves_cropbox_on_an_already_rotated_page(self):
+        document = fitz.open("pdf", self._source_pdf())
+        document[0].set_rotation(90)
+        source_bytes = document.tobytes()
+        document.close()
+        pending_crop = (30.0, 20.0, 150.0, 75.0)
+        expected_crop = transform_crop_rects_for_rotations(
+            source_bytes,
+            {0: pending_crop},
+            {0: 5.0},
+        )[0]
+
+        output = fitz.open("pdf", rotate_pdf_bytes(source_bytes, {0: 5.0}))
+
+        self.assertEqual(output[0].rotation, 0)
+        self.assertNotEqual(output[0].cropbox, output[0].mediabox)
+        self.assertTrue(output[0].cropbox.contains(fitz.Rect(expected_crop)))
+        angle = math.radians(5.0)
+        self.assertAlmostEqual(
+            fitz.Rect(expected_crop).width,
+            55.0 * math.cos(angle) + 120.0 * math.sin(angle),
+            places=3,
+        )
+        self.assertAlmostEqual(
+            fitz.Rect(expected_crop).height,
+            120.0 * math.cos(angle) + 55.0 * math.sin(angle),
+            places=3,
+        )
+        self.assertIn("VECTOR TEXT", output[0].get_text())
+        self.assertEqual(len(output[0].get_links()), 1)
+        self.assertEqual(len(list(output[0].annots() or ())), 1)
         output.close()
 
     def test_deskew_applies_independent_detected_angles(self):
@@ -113,6 +193,29 @@ class PageRotationTests(unittest.TestCase):
         self.assertGreater(output[0].mediabox.width, 200)
         self.assertEqual(output[1].mediabox, fitz.Rect(0, 0, 200, 100))
         output.close()
+
+    def test_auto_deskew_worker_returns_transformed_pending_crops(self):
+        source_bytes = self._source_pdf()
+        crop_rects = {0: (30.0, 20.0, 150.0, 75.0)}
+        transformed = {0: (31.0, 21.0, 151.0, 76.0)}
+        results = []
+        worker = AutoDeskewWorker(source_bytes, [0], max_workers=1, crop_rects=crop_rects)
+        worker.signals.result.connect(results.append)
+
+        with (
+            patch(
+                "pycroppdf.workers.deskew_pdf_bytes",
+                return_value=(source_bytes, {0: 2.0}, []),
+            ),
+            patch(
+                "pycroppdf.workers.transform_crop_rects_for_rotations",
+                return_value=transformed,
+            ) as transform_crops,
+        ):
+            worker.run()
+
+        transform_crops.assert_called_once_with(source_bytes, crop_rects, {0: 2.0})
+        self.assertEqual(results[0]["crop_rects"], transformed)
 
     @unittest.skipUnless(deskew_available(), "optional deskew dependency is not installed")
     def test_optional_deskew_detects_a_known_text_skew(self):

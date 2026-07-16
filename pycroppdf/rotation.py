@@ -67,6 +67,120 @@ def _transformed_rect(rect: fitz.Rect, matrix: fitz.Matrix) -> fitz.Rect:
     return transformed
 
 
+def _page_rotation_geometry(
+    media_box: fitz.Rect,
+    clockwise_degrees: float,
+) -> tuple[fitz.Matrix, fitz.Rect]:
+    """Return the visual transform and normalized media box for a rotation."""
+    rotation = fitz.Matrix(clockwise_degrees)
+    rotated_media = _transformed_rect(media_box, rotation)
+    translation = fitz.Matrix(1, 0, 0, 1, -rotated_media.x0, -rotated_media.y0)
+    visual_matrix = rotation * translation
+    new_media = fitz.Rect(0, 0, rotated_media.width, rotated_media.height)
+    return visual_matrix, new_media
+
+
+def _optional_page_boxes(page: fitz.Page) -> dict[str, fitz.Rect]:
+    return {
+        "artbox": fitz.Rect(page.artbox),
+        "bleedbox": fitz.Rect(page.bleedbox),
+        "trimbox": fitz.Rect(page.trimbox),
+    }
+
+
+def _restore_transformed_boxes(
+    page: fitz.Page,
+    crop_box: fitz.Rect,
+    optional_boxes: Mapping[str, fitz.Rect],
+    matrix: fitz.Matrix,
+) -> None:
+    """Restore page boxes that PyMuPDF resets while baking page rotation."""
+    media_box = fitz.Rect(page.mediabox)
+    transformed_crop = _transformed_rect(crop_box, matrix)
+    transformed_crop.intersect(media_box)
+    if transformed_crop.is_empty:
+        raise ValueError("Rotation moved the page crop outside its media box.")
+    page.set_cropbox(transformed_crop)
+
+    setters = {
+        "artbox": page.set_artbox,
+        "bleedbox": page.set_bleedbox,
+        "trimbox": page.set_trimbox,
+    }
+    for name, original_box in optional_boxes.items():
+        transformed = _transformed_rect(original_box, matrix)
+        transformed.intersect(media_box)
+        if not transformed.is_empty:
+            setters[name](transformed)
+
+
+def transform_crop_rects_for_rotations(
+    pdf_bytes: bytes,
+    crop_rects: Mapping[int, Iterable[float]],
+    rotations: Mapping[int, float],
+) -> dict[int, tuple[float, float, float, float]]:
+    """Map pending crop rectangles into the coordinate space of rotated pages.
+
+    Native quarter turns only change the page rotation field, so unrotated PDF
+    coordinates remain valid. Arbitrary rotations are baked into page content;
+    the complete crop rectangle follows the same visual matrices. Its bounding
+    rectangle expands as needed so rotating an already cropped page does not
+    clip the crop's corners.
+    """
+    if not crop_rects or not rotations:
+        return {}
+
+    document = fitz.open("pdf", pdf_bytes)
+    transformed_rects: dict[int, tuple[float, float, float, float]] = {}
+    try:
+        for raw_page_num, raw_angle in sorted(rotations.items()):
+            page_num = int(raw_page_num)
+            if page_num not in crop_rects:
+                continue
+            if page_num < 0 or page_num >= len(document):
+                raise ValueError(f"Page {page_num + 1} is outside the document.")
+
+            page = document[page_num]
+            crop_rect = fitz.Rect(crop_rects[page_num])
+            crop_rect.intersect(page.cropbox)
+            if crop_rect.is_empty:
+                raise ValueError(f"Crop rectangle for page {page_num + 1} is outside the page.")
+
+            clockwise_degrees = normalize_angle(float(raw_angle))
+            quarter_turns = round(clockwise_degrees / 90.0)
+            if math.isclose(
+                clockwise_degrees,
+                quarter_turns * 90.0,
+                abs_tol=ANGLE_EPSILON,
+            ):
+                transformed_rects[page_num] = tuple(float(value) for value in crop_rect)
+                continue
+
+            media_box = fitz.Rect(page.mediabox)
+            page_bounds = fitz.Rect(page.cropbox)
+            if page.rotation:
+                existing_rotation, media_box = _page_rotation_geometry(
+                    media_box,
+                    page.rotation,
+                )
+                crop_rect = _transformed_rect(crop_rect, existing_rotation)
+                page_bounds = _transformed_rect(page_bounds, existing_rotation)
+
+            fine_rotation, new_media = _page_rotation_geometry(media_box, clockwise_degrees)
+            crop_rect = _transformed_rect(crop_rect, fine_rotation)
+            page_bounds = _transformed_rect(page_bounds, fine_rotation)
+            page_bounds.intersect(new_media)
+            if page_bounds.is_empty:
+                raise ValueError(f"Rotation moved the crop for page {page_num + 1} off the page.")
+            crop_rect.intersect(page_bounds)
+            if crop_rect.is_empty:
+                raise ValueError(f"Rotation moved the crop for page {page_num + 1} off the page.")
+            transformed_rects[page_num] = tuple(float(value) for value in crop_rect)
+        return transformed_rects
+    finally:
+        document.close()
+
+
 def _capture_page_objects(page: fitz.Page) -> tuple[list[dict], list[dict], list[dict]]:
     annotations = [
         {
@@ -167,24 +281,30 @@ def rotate_page_content(
         return
 
     if page.rotation:
+        existing_media = fitz.Rect(page.mediabox)
+        existing_crop = fitz.Rect(page.cropbox)
+        existing_optional_boxes = _optional_page_boxes(page)
+        existing_rotation, _new_media = _page_rotation_geometry(
+            existing_media,
+            page.rotation,
+        )
         page.remove_rotation()
         page = document.reload_page(page)
+        _restore_transformed_boxes(
+            page,
+            existing_crop,
+            existing_optional_boxes,
+            existing_rotation,
+        )
 
     annotations, links, widgets = _capture_page_objects(page)
     old_transformation = fitz.Matrix(page.transformation_matrix)
     media_box = fitz.Rect(page.mediabox)
     crop_box = fitz.Rect(page.cropbox)
-    optional_boxes = {
-        "artbox": fitz.Rect(page.artbox),
-        "bleedbox": fitz.Rect(page.bleedbox),
-        "trimbox": fitz.Rect(page.trimbox),
-    }
+    optional_boxes = _optional_page_boxes(page)
     original_contents = page.read_contents()
 
-    rotation = fitz.Matrix(clockwise_degrees)
-    rotated_media = _transformed_rect(media_box, rotation)
-    translation = fitz.Matrix(1, 0, 0, 1, -rotated_media.x0, -rotated_media.y0)
-    visual_matrix = rotation * translation
+    visual_matrix, _new_media = _page_rotation_geometry(media_box, clockwise_degrees)
 
     _set_transformed_page_boxes(page, media_box, crop_box, optional_boxes, visual_matrix)
     new_transformation = fitz.Matrix(page.transformation_matrix)

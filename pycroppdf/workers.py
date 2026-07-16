@@ -14,7 +14,12 @@ from PyQt6.QtCore import QObject, QRectF, QRunnable, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from .provenance import build_manifest, sha256_file, write_manifest
-from .rotation import deskew_pdf_bytes, recommended_deskew_workers, rotate_pdf_bytes
+from .rotation import (
+    deskew_pdf_bytes,
+    recommended_deskew_workers,
+    rotate_pdf_bytes,
+    transform_crop_rects_for_rotations,
+)
 
 MAX_RENDER_WORKERS = 4
 LOCAL_RENDER_PAGE_LIMIT = 2
@@ -264,19 +269,33 @@ class RenderAllPagesWorker(QRunnable):
 class RotatePagesWorker(QRunnable):
     """Apply manual page rotations outside the GUI thread."""
 
-    def __init__(self, pdf_bytes: bytes, rotations: dict[int, float]):
+    def __init__(
+        self,
+        pdf_bytes: bytes,
+        rotations: dict[int, float],
+        crop_rects: dict[int, Iterable[float]] | None = None,
+    ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.rotations = {int(page_num): float(angle) for page_num, angle in rotations.items()}
+        self.crop_rects = {
+            int(page_num): rect_to_tuple(rect) for page_num, rect in (crop_rects or {}).items()
+        }
 
     def run(self) -> None:
         try:
+            transformed_crop_rects = transform_crop_rects_for_rotations(
+                self.pdf_bytes,
+                self.crop_rects,
+                self.rotations,
+            )
             rotated_pdf = rotate_pdf_bytes(self.pdf_bytes, self.rotations)
             self.signals.result.emit(
                 {
                     "pdf_bytes": rotated_pdf,
                     "rotation_deltas": dict(self.rotations),
+                    "crop_rects": transformed_crop_rects,
                     "undetected_pages": [],
                 }
             )
@@ -294,11 +313,15 @@ class AutoDeskewWorker(QRunnable):
         pdf_bytes: bytes,
         page_numbers: Iterable[int],
         max_workers: int | None = None,
+        crop_rects: dict[int, Iterable[float]] | None = None,
     ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.page_numbers = tuple(sorted({int(page_num) for page_num in page_numbers}))
+        self.crop_rects = {
+            int(page_num): rect_to_tuple(rect) for page_num, rect in (crop_rects or {}).items()
+        }
         self.max_workers = (
             recommended_deskew_workers(len(self.page_numbers))
             if max_workers is None
@@ -312,10 +335,16 @@ class AutoDeskewWorker(QRunnable):
                 self.page_numbers,
                 max_workers=self.max_workers,
             )
+            transformed_crop_rects = transform_crop_rects_for_rotations(
+                self.pdf_bytes,
+                self.crop_rects,
+                rotations,
+            )
             self.signals.result.emit(
                 {
                     "pdf_bytes": deskewed_pdf,
                     "rotation_deltas": rotations,
+                    "crop_rects": transformed_crop_rects,
                     "undetected_pages": undetected,
                     "worker_count": self.max_workers,
                 }
