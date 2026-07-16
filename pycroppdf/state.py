@@ -2,9 +2,109 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
+from typing import Any
 
 from PyQt6.QtCore import QRectF
+
+MAX_UNDO_SNAPSHOTS = 10
+MAX_UNDO_DISK_BYTES = 512 * 1024 * 1024
+
+
+class UndoSnapshotStore:
+    """Own disk-backed PDF snapshots and their bounded undo history."""
+
+    def __init__(
+        self,
+        max_entries: int = MAX_UNDO_SNAPSHOTS,
+        max_disk_bytes: int = MAX_UNDO_DISK_BYTES,
+    ) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.max_disk_bytes = max(0, int(max_disk_bytes))
+        self.entries: list[dict[str, Any]] = []
+        self._temporary_directory = tempfile.TemporaryDirectory(prefix="pycroppdf-undo-")
+
+    def write_document(self, document: Any) -> tuple[str, int]:
+        """Write the current PDF state without retaining another in-memory copy."""
+        file_descriptor, path = tempfile.mkstemp(
+            prefix="snapshot-",
+            suffix=".pdf",
+            dir=self._temporary_directory.name,
+        )
+        os.close(file_descriptor)
+        try:
+            document.save(path, garbage=0, deflate=False, no_new_id=True)
+            with suppress(OSError):
+                os.chmod(path, 0o600)
+            return path, os.path.getsize(path)
+        except Exception:
+            with suppress(OSError):
+                os.remove(path)
+            raise
+
+    @staticmethod
+    def read_document(snapshot: Mapping[str, Any]) -> bytes:
+        """Read a snapshot for reopening as a memory-backed active document."""
+        path = snapshot.get("pdf_path")
+        if not path:
+            raise ValueError("The undo snapshot has no PDF document state.")
+        with open(os.fspath(path), "rb") as snapshot_file:
+            return snapshot_file.read()
+
+    def append(self, snapshot: dict[str, Any]) -> None:
+        self.entries.append(snapshot)
+        self._enforce_limits()
+
+    def pop(self, index: int = -1) -> dict[str, Any]:
+        return self.entries.pop(index)
+
+    def release(self, snapshot: Mapping[str, Any]) -> None:
+        path = snapshot.get("pdf_path")
+        if path:
+            with suppress(OSError):
+                os.remove(os.fspath(path))
+
+    def discard(self, snapshot: dict[str, Any]) -> None:
+        for index, entry in enumerate(self.entries):
+            if entry is snapshot:
+                self.entries.pop(index)
+                break
+        self.release(snapshot)
+
+    def clear(self) -> None:
+        for snapshot in self.entries:
+            self.release(snapshot)
+        self.entries.clear()
+
+    def close(self) -> None:
+        self.clear()
+        self._temporary_directory.cleanup()
+
+    def _enforce_limits(self) -> None:
+        while len(self.entries) > self.max_entries:
+            self.release(self.entries.pop(0))
+
+        total_disk_bytes = sum(
+            max(0, int(snapshot.get("pdf_size", 0))) for snapshot in self.entries
+        )
+        document_snapshot_count = sum(bool(snapshot.get("pdf_path")) for snapshot in self.entries)
+        while document_snapshot_count > 1 and total_disk_bytes > self.max_disk_bytes:
+            removed_index = next(
+                index for index, snapshot in enumerate(self.entries) if snapshot.get("pdf_path")
+            )
+            removed_entries = self.entries[: removed_index + 1]
+            del self.entries[: removed_index + 1]
+            total_disk_bytes -= sum(
+                max(0, int(snapshot.get("pdf_size", 0))) for snapshot in removed_entries
+            )
+            document_snapshot_count -= sum(
+                bool(snapshot.get("pdf_path")) for snapshot in removed_entries
+            )
+            for snapshot in removed_entries:
+                self.release(snapshot)
 
 
 def clone_crop_info(crop_info: dict | None) -> dict | None:

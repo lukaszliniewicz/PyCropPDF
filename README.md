@@ -57,11 +57,11 @@ Optional arguments:
 2. Use **View** to choose one overlay for all pages or separate odd/even overlays.
 3. Click a thumbnail image to preview that page. Click it again or use **Stack** to return. Thumbnail checkboxes select pages for deletion; `Ctrl`/`Cmd` toggles and `Shift` selects a range.
 4. Open **Rotate**, choose all, odd, even, or the previewed page, and enter an angle. Click **Preview** to inspect a fine rotation, **Discard** to clear it, or **Apply** to change the PDF. The 90-degree buttons apply immediately; **Auto deskew** detects and corrects small angles per page.
-5. Click **Cover** to open its toolbar. Choose a color or pick one from the page, then draw the cover. It is applied to every page and does not remove the underlying PDF content.
-6. Click **Crop**, draw a crop box, then click **Apply Crop**. Odd/even positions are independent and their sizes stay uniform. To override one page, preview it, enable **This page**, draw its crop box, and apply the crop again.
+5. Click **Cover**, choose **All**, **Odd**, or **Even**, then draw the cover. In a page preview, **This page only** overrides that scope. New covers are added without replacing existing ones and do not remove the underlying PDF content.
+6. Click **Crop**, draw a crop box, then click **Apply Crop**. Odd/even positions are independent and their sizes stay uniform. To override one page, preview it, enable **This page only**, draw its crop box, and apply the crop again.
 7. Use **Undo** or `Ctrl`+`Z` to revert an edit, then click **Save**.
 
-Crop and Cover apply to all pages. A per-page crop override replaces the stack crop only for that page.
+Crop applies to all pages. Cover uses its selected scope and remains additive. A per-page crop override replaces the stack crop only for that page.
 
 Rotate and add covers before cropping. If a crop preview is active, reset it before using those tools. For pages with links, annotations, or form fields, the app warns before a fine-angle rotation because some appearances or destinations cannot be transformed exactly.
 
@@ -70,7 +70,7 @@ Rotate and add covers before cropping. If a crop preview is active, reset it bef
 | Tool | Effect |
 | --- | --- |
 | **Crop Box** | Changes the PDF CropBox. The content outside the visible area remains in the file. |
-| **Cover** | Draws a rectangle in the selected color. The covered content remains in the file. |
+| **Cover** | Adds a rectangle to all, odd, even, or only the previewed page. Existing covers and covered content remain in the file. |
 | **Rotation** | Rotates page content without rasterizing it. Exact 90-degree turns use PDF rotation metadata. |
 | **Auto deskew** | Detects a small text-line angle independently for each target page. Requires `pycroppdf[deskew]`. |
 

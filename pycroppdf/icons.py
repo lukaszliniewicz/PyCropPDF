@@ -20,10 +20,7 @@ _ICON_BODIES = {
     "stack": ('<rect x="6" y="4" width="13" height="15" rx="1"/><path d="M4 7v14h12"/>'),
     "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7h.01"/>',
     "crop": '<path d="M7 3v14a2 2 0 0 0 2 2h12"/><path d="M3 7h14a2 2 0 0 1 2 2v12"/>',
-    "cover": (
-        '<rect x="3" y="7" width="18" height="11" rx="1"/>'
-        '<path d="M7 7V4h10v3"/><path d="m7 13 3 3 7-7"/>'
-    ),
+    "cover": '<rect x="3" y="6" width="18" height="12" rx="1"/>',
     "rotate": ('<path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-1.4 4.2"/>'),
     "delete": (
         '<path d="M4 7h16"/><path d="M9 7V4h6v3"/>'

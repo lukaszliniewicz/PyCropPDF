@@ -1,6 +1,7 @@
 import logging
 import os
 from contextlib import suppress
+from typing import Any
 
 import fitz
 from PyQt6.QtCore import QEvent, QRectF, QSignalBlocker, Qt, QThreadPool
@@ -45,6 +46,7 @@ from .rotation import (
     recommended_deskew_workers,
 )
 from .state import (
+    UndoSnapshotStore,
     clone_crop_info,
     remap_crop_info_after_deletions,
     remap_page_indices_after_deletions,
@@ -91,7 +93,8 @@ class PDFViewer(QMainWindow):
         self.active_crop_info = None
         self.active_tool = "crop"
         self._is_syncing_selection = False
-        self.undo_stack = []
+        self.undo_store = UndoSnapshotStore()
+        self.undo_stack = self.undo_store.entries
         self.page_map = []
         self.original_page_count = 0
         self.cover_operations = []
@@ -253,7 +256,8 @@ class PDFViewer(QMainWindow):
         self.fast_save_action.setCheckable(True)
         self.fast_save_action.setChecked(True)
         self.fast_save_action.setToolTip(
-            "Disable compression for faster saving. May result in a larger file size."
+            "Skip stream compression and xref compaction while still removing unused PDF "
+            "objects. May result in a larger file."
         )
         file_menu.addAction(self.fast_save_action)
 
@@ -331,7 +335,9 @@ class PDFViewer(QMainWindow):
         self.rotation_options_toggle_btn = QPushButton("Rotate")
         self.rotation_options_toggle_btn.setIcon(vector_icon("rotate"))
         self.rotation_options_toggle_btn.setCheckable(True)
-        self.rotation_options_toggle_btn.setToolTip("Show rotation and deskew controls.")
+        self.rotation_options_toggle_btn.setToolTip("Show rotation and Auto deskew controls.")
+        self.rotation_options_toggle_btn.clicked.connect(lambda: self.setActiveTool("rotate"))
+        self.tool_button_group.addButton(self.rotation_options_toggle_btn)
         toolbar.addWidget(self.rotation_options_toggle_btn)
 
         self.view_stack_btn = QPushButton("Stack")
@@ -390,7 +396,7 @@ class PDFViewer(QMainWindow):
 
         crop_toolbar.addSeparator()
 
-        self.crop_page_override_checkbox = QCheckBox("This page")
+        self.crop_page_override_checkbox = QCheckBox("This page only")
         self.crop_page_override_checkbox.setChecked(False)
         self.crop_page_override_checkbox.setToolTip(
             "In a page preview, give that page its own crop size and position."
@@ -418,7 +424,27 @@ class PDFViewer(QMainWindow):
         cover_toolbar.addWidget(self.pick_cover_color_btn)
 
         cover_toolbar.addSeparator()
-        self.cover_note_label = QLabel("Visual cover only — underlying content remains")
+
+        self.cover_scope_combo = QComboBox()
+        self.cover_scope_combo.addItem("All", "all")
+        self.cover_scope_combo.addItem("Odd", "odd")
+        self.cover_scope_combo.addItem("Even", "even")
+        self.cover_scope_combo.setToolTip(
+            "Choose which page stack receives new covers. Existing covers remain."
+        )
+        self.cover_scope_combo.currentIndexChanged.connect(self.onCoverScopeChanged)
+        cover_toolbar.addWidget(self.cover_scope_combo)
+
+        self.cover_page_override_checkbox = QCheckBox("This page only")
+        self.cover_page_override_checkbox.setChecked(False)
+        self.cover_page_override_checkbox.setToolTip(
+            "In a page preview, add covers only to that page. Existing covers remain."
+        )
+        self.cover_page_override_checkbox.toggled.connect(self.onCoverPageOverrideToggled)
+        cover_toolbar.addWidget(self.cover_page_override_checkbox)
+
+        cover_toolbar.addSeparator()
+        self.cover_note_label = QLabel("Content remains in PDF")
         self.cover_note_label.setToolTip(
             "Cover draws over content but does not remove it from the PDF."
         )
@@ -432,9 +458,8 @@ class PDFViewer(QMainWindow):
         rotation_toolbar.setFloatable(False)
         rotation_toolbar.setIconSize(icon_size())
         self.rotation_toolbar = rotation_toolbar
-        self.rotation_options_toggle_btn.toggled.connect(rotation_toolbar.setVisible)
 
-        self.rotation_page_override_checkbox = QCheckBox("This page")
+        self.rotation_page_override_checkbox = QCheckBox("This page only")
         self.rotation_page_override_checkbox.setChecked(False)
         self.rotation_page_override_checkbox.setToolTip(
             "In a page preview, apply rotation or deskew only to that page."
@@ -448,19 +473,21 @@ class PDFViewer(QMainWindow):
         self.rotation_scope_combo.addItem("Odd", "odd")
         self.rotation_scope_combo.addItem("Even", "even")
         self.rotation_scope_combo.setToolTip(
-            "Choose the page stack to rotate, or enable This page in a page preview."
+            "Choose the page stack to rotate, or enable This page only in a page preview."
         )
         self.rotation_scope_combo.currentIndexChanged.connect(self.rotationPreviewInputsChanged)
         rotation_toolbar.addWidget(self.rotation_scope_combo)
 
-        self.rotate_left_btn = QPushButton("90° L")
+        self.rotate_left_btn = QPushButton()
         self.rotate_left_btn.setIcon(vector_icon("rotate-left"))
+        self.rotate_left_btn.setAccessibleName("Rotate 90 degrees counter-clockwise")
         self.rotate_left_btn.setToolTip("Rotate the selected page stack 90° counter-clockwise.")
         self.rotate_left_btn.clicked.connect(lambda: self.applyRotation(-90.0))
         rotation_toolbar.addWidget(self.rotate_left_btn)
 
-        self.rotate_right_btn = QPushButton("90° R")
+        self.rotate_right_btn = QPushButton()
         self.rotate_right_btn.setIcon(vector_icon("rotate-right"))
+        self.rotate_right_btn.setAccessibleName("Rotate 90 degrees clockwise")
         self.rotate_right_btn.setToolTip("Rotate the selected page stack 90° clockwise.")
         self.rotate_right_btn.clicked.connect(lambda: self.applyRotation(90.0))
         rotation_toolbar.addWidget(self.rotate_right_btn)
@@ -524,6 +551,8 @@ class PDFViewer(QMainWindow):
             self.crop_page_override_checkbox,
             self.cover_color_btn,
             self.pick_cover_color_btn,
+            self.cover_scope_combo,
+            self.cover_page_override_checkbox,
             self.cover_note_label,
             self.rotation_page_override_checkbox,
             self.rotation_scope_combo,
@@ -617,27 +646,35 @@ class PDFViewer(QMainWindow):
         self.reloadImages(affected_pages)
 
     def setActiveTool(self, tool):
-        if tool == "cover" and self.active_crop_info:
+        if tool in {"cover", "rotate"} and self.active_crop_info:
+            message = (
+                "A cover cannot be positioned reliably on an active cropped preview."
+                if tool == "cover"
+                else "Rotation cannot be applied reliably on an active cropped preview."
+            )
             QMessageBox.warning(
                 self,
                 "Reset Crop First",
-                "A cover cannot be positioned reliably on an active cropped preview. "
-                "Reset the crop, apply the cover, then crop again.",
+                f"{message} Reset the crop, make the change, then crop again.",
             )
             tool = "crop"
 
-        self.active_tool = tool if tool in {"crop", "cover"} else "crop"
+        self.active_tool = tool if tool in {"crop", "cover", "rotate"} else "crop"
         self.crop_tool_btn.setChecked(self.active_tool == "crop")
         self.cover_tool_btn.setChecked(self.active_tool == "cover")
+        self.rotation_options_toggle_btn.setChecked(self.active_tool == "rotate")
         self.crop_toolbar.setVisible(self.active_tool == "crop")
         self.cover_toolbar.setVisible(self.active_tool == "cover")
+        self.rotation_toolbar.setVisible(self.active_tool == "rotate")
         view_tool = "cover" if self.active_tool == "cover" else "select"
         for view in [self.single_view, self.odd_view, self.even_view]:
             view.setTool(view_tool)
 
         if self.active_tool == "cover":
+            self._showCoverScopeStatus()
+        elif self.active_tool == "rotate":
             self.statusBar().showMessage(
-                "Cover selected. It draws over every page; underlying PDF content remains.",
+                "Rotate selected. Choose the target pages and rotation.",
                 6000,
             )
         else:
@@ -688,39 +725,116 @@ class PDFViewer(QMainWindow):
             return True
         return super().eventFilter(watched, event)
 
-    def pushUndo(self, include_pdf=True, pdf_bytes=None):
-        if self.pdf_doc:
-            self.undo_stack.append(
-                {
-                    "pdf_bytes": (pdf_bytes if pdf_bytes is not None else self.pdf_doc.tobytes())
-                    if include_pdf
-                    else None,
-                    "page_map": list(self.page_map),
-                    "covers": [dict(operation) for operation in self.cover_operations],
-                    "rotations": [dict(operation) for operation in self.rotation_operations],
-                    "active_crop_info": clone_crop_info(self.active_crop_info),
-                    "selected_pages": set(self.selected_pages),
-                    "selection_anchor": self.selection_anchor,
-                    "preview_page_num": self.preview_page_num,
-                    "page_crop_overrides": dict(self.page_crop_overrides),
-                    "crop_selections": {
-                        "single": self._selection_copy(self.single_view),
-                        "odd": self._selection_copy(self.odd_view),
-                        "even": self._selection_copy(self.even_view),
-                        "before_preview": (
-                            QRectF(self._selection_before_preview)
-                            if self._selection_before_preview
-                            else None
-                        ),
-                    },
-                    "crop_page_override": self._per_page_crop_override_enabled(),
-                    "rotation_page_override": self._per_page_rotation_override_enabled(),
-                    "is_dirty": self.is_dirty,
-                }
+    def pushUndo(self, include_pdf: bool = True) -> dict[str, Any] | None:
+        if self.pdf_doc is None:
+            return None
+
+        pdf_path = None
+        pdf_size = 0
+        if include_pdf:
+            try:
+                pdf_path, pdf_size = self.undo_store.write_document(self.pdf_doc)
+            except Exception as error:
+                LOGGER.exception("Failed to create an undo document snapshot.")
+                QMessageBox.critical(
+                    self,
+                    "Undo Snapshot Failed",
+                    "The edit was not applied because its undo snapshot could not be created.\n\n"
+                    f"{error}",
+                )
+                return None
+
+        snapshot = {
+            "pdf_path": pdf_path,
+            "pdf_size": pdf_size,
+            "page_map": list(self.page_map),
+            "covers": [dict(operation) for operation in self.cover_operations],
+            "rotations": [dict(operation) for operation in self.rotation_operations],
+            "active_crop_info": clone_crop_info(self.active_crop_info),
+            "selected_pages": set(self.selected_pages),
+            "selection_anchor": self.selection_anchor,
+            "preview_page_num": self.preview_page_num,
+            "page_crop_overrides": dict(self.page_crop_overrides),
+            "crop_selections": {
+                "single": self._selection_copy(self.single_view),
+                "odd": self._selection_copy(self.odd_view),
+                "even": self._selection_copy(self.even_view),
+                "before_preview": (
+                    QRectF(self._selection_before_preview)
+                    if self._selection_before_preview
+                    else None
+                ),
+            },
+            "crop_page_override": self._per_page_crop_override_enabled(),
+            "cover_page_override": self._per_page_cover_override_enabled(),
+            "rotation_page_override": self._per_page_rotation_override_enabled(),
+            "is_dirty": self.is_dirty,
+        }
+        self.undo_store.append(snapshot)
+        self.updateActionState()
+        return snapshot
+
+    def _restoreUndoSnapshot(self, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("pdf_path"):
+            new_document = fitz.open("pdf", self.undo_store.read_document(snapshot))
+            old_document = self.pdf_doc
+            self.pdf_doc = new_document
+            if old_document is not None:
+                old_document.close()
+            self.invalidate_pixmap_cache()
+
+        self.page_map = list(snapshot["page_map"])
+        self.cover_operations = list(snapshot.get("covers", snapshot.get("whiteouts", [])))
+        self.rotation_operations = list(snapshot.get("rotations", []))
+        self.active_crop_info = clone_crop_info(snapshot.get("active_crop_info"))
+        self.selected_pages = set(snapshot.get("selected_pages", set()))
+        self.selection_anchor = snapshot.get("selection_anchor")
+        self.preview_page_num = snapshot.get("preview_page_num")
+        self.page_crop_overrides = dict(snapshot.get("page_crop_overrides", {}))
+        crop_selections = snapshot.get("crop_selections", {})
+        for name, view in (
+            ("single", self.single_view),
+            ("odd", self.odd_view),
+            ("even", self.even_view),
+        ):
+            selection = crop_selections.get(name)
+            if selection:
+                view.setSelection(QRectF(selection), notify=False)
+            else:
+                view.clearSelection(notify=False)
+        self._selection_before_preview = crop_selections.get("before_preview")
+        with QSignalBlocker(self.crop_page_override_checkbox):
+            self.crop_page_override_checkbox.setChecked(
+                bool(snapshot.get("crop_page_override") and self.preview_page_num is not None)
             )
-            if len(self.undo_stack) > 10:  # Limit stack size
-                self.undo_stack.pop(0)
-            self.updateActionState()
+        with QSignalBlocker(self.cover_page_override_checkbox):
+            self.cover_page_override_checkbox.setChecked(
+                bool(snapshot.get("cover_page_override") and self.preview_page_num is not None)
+            )
+        with QSignalBlocker(self.rotation_page_override_checkbox):
+            self.rotation_page_override_checkbox.setChecked(
+                bool(snapshot.get("rotation_page_override") and self.preview_page_num is not None)
+            )
+        self.is_dirty = bool(snapshot.get("is_dirty", False))
+        self.updateActionState()
+
+    def _discardLastUndoSnapshot(self) -> None:
+        if not self.undo_stack:
+            return
+        self.undo_store.release(self.undo_store.pop())
+        self.updateActionState()
+
+    def _rollbackUndoSnapshot(self, snapshot: dict[str, Any] | None) -> bool:
+        if snapshot is None:
+            return False
+        try:
+            self._restoreUndoSnapshot(snapshot)
+        except Exception:
+            LOGGER.exception("Failed to roll back an edit from its undo snapshot.")
+            return False
+        self.undo_store.discard(snapshot)
+        self.updateActionState()
+        return True
 
     def undo(self):
         if not self.undo_stack:
@@ -728,48 +842,16 @@ class PDFViewer(QMainWindow):
 
         try:
             self.statusBar().showMessage("Restoring previous document state...")
-            snapshot = self.undo_stack.pop()
-
-            if snapshot.get("pdf_bytes") is not None:
-                if self.pdf_doc:
-                    self.pdf_doc.close()
-                self.pdf_doc = fitz.open("pdf", snapshot["pdf_bytes"])
-            self.page_map = list(snapshot["page_map"])
-            self.cover_operations = list(snapshot.get("covers", snapshot.get("whiteouts", [])))
-            self.rotation_operations = list(snapshot.get("rotations", []))
-            self.active_crop_info = clone_crop_info(snapshot.get("active_crop_info"))
-            self.selected_pages = set(snapshot.get("selected_pages", set()))
-            self.selection_anchor = snapshot.get("selection_anchor")
-            self.preview_page_num = snapshot.get("preview_page_num")
-            self.page_crop_overrides = dict(snapshot.get("page_crop_overrides", {}))
-            crop_selections = snapshot.get("crop_selections", {})
-            for name, view in (
-                ("single", self.single_view),
-                ("odd", self.odd_view),
-                ("even", self.even_view),
-            ):
-                selection = crop_selections.get(name)
-                if selection:
-                    view.setSelection(QRectF(selection), notify=False)
-                else:
-                    view.clearSelection(notify=False)
-            self._selection_before_preview = crop_selections.get("before_preview")
-            with QSignalBlocker(self.crop_page_override_checkbox):
-                self.crop_page_override_checkbox.setChecked(
-                    bool(snapshot.get("crop_page_override") and self.preview_page_num is not None)
-                )
-            with QSignalBlocker(self.rotation_page_override_checkbox):
-                self.rotation_page_override_checkbox.setChecked(
-                    bool(
-                        snapshot.get("rotation_page_override") and self.preview_page_num is not None
-                    )
-                )
-            self.is_dirty = bool(snapshot.get("is_dirty", False))
+            snapshot = self.undo_stack[-1]
+            self._restoreUndoSnapshot(snapshot)
+            self.undo_store.discard(snapshot)
+            self.updateActionState()
             self.pending_status_message = "Undo complete."
             self.reloadImages()
-        except Exception as e:
+        except Exception as error:
+            LOGGER.exception("Failed to restore an undo snapshot.")
             self.setUIProcessing(False)
-            QMessageBox.critical(self, "Error", f"Failed to undo: {e!s}")
+            QMessageBox.critical(self, "Error", f"Failed to undo: {error!s}")
 
     @staticmethod
     def _selection_with_size(rect, existing_rect):
@@ -779,6 +861,49 @@ class PDFViewer(QMainWindow):
 
     def _per_page_crop_override_enabled(self):
         return self.preview_page_num is not None and self.crop_page_override_checkbox.isChecked()
+
+    def _per_page_cover_override_enabled(self):
+        return self.preview_page_num is not None and self.cover_page_override_checkbox.isChecked()
+
+    def _cover_target_pages(self):
+        if self.pdf_doc is None:
+            return []
+        if self._per_page_cover_override_enabled():
+            return [self.preview_page_num]
+        scope = self.cover_scope_combo.currentData()
+        if scope == "odd":
+            return list(range(0, len(self.pdf_doc), 2))
+        if scope == "even":
+            return list(range(1, len(self.pdf_doc), 2))
+        return list(range(len(self.pdf_doc)))
+
+    def _cover_target_description(self, target_pages):
+        target_pages = tuple(sorted({int(page_num) for page_num in target_pages}))
+        if not target_pages:
+            return "no pages"
+        if len(target_pages) == 1:
+            return f"page {target_pages[0] + 1}"
+        if self.pdf_doc is not None:
+            if target_pages == tuple(range(len(self.pdf_doc))):
+                return f"all {len(target_pages)} pages"
+            if target_pages == tuple(range(0, len(self.pdf_doc), 2)):
+                return f"{len(target_pages)} odd pages"
+            if target_pages == tuple(range(1, len(self.pdf_doc), 2)):
+                return f"{len(target_pages)} even pages"
+        return f"{len(target_pages)} pages"
+
+    def _showCoverScopeStatus(self):
+        if self.active_tool != "cover":
+            return
+        target_pages = self._cover_target_pages()
+        if not target_pages:
+            self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
+            return
+        target = self._cover_target_description(target_pages)
+        self.statusBar().showMessage(
+            f"Cover target: {target}. Draw a rectangle; existing covers remain.",
+            6000,
+        )
 
     def _per_page_rotation_override_enabled(self):
         return (
@@ -812,6 +937,19 @@ class PDFViewer(QMainWindow):
                     f"Page {page_num + 1} now follows its stack settings.", 6000
                 )
         self.updateActionState()
+
+    def onCoverPageOverrideToggled(self, enabled):
+        if enabled and self.preview_page_num is None:
+            with QSignalBlocker(self.cover_page_override_checkbox):
+                self.cover_page_override_checkbox.setChecked(False)
+            return
+
+        self.updateActionState()
+        self._showCoverScopeStatus()
+
+    def onCoverScopeChanged(self, *_args):
+        self.updateActionState()
+        self._showCoverScopeStatus()
 
     def _stack_selection_for_page(self, page_num):
         if self.view_mode == "all":
@@ -966,11 +1104,11 @@ class PDFViewer(QMainWindow):
         help_text = """<b>Basic Usage:</b>
 <ol>
 <li>Open a PDF using <b>File > Open PDF...</b> or by dragging it into the window.</li>
-<li>Click <b>Crop</b> to open its controls. Draw crop boxes in the stack view. Odd/even positions stay independent while their sizes stay uniform. In a page preview, enable <b>This page</b> to make that page differ.</li>
-<li>Click <b>Cover</b> to choose or pick a color, then draw a visual cover. It applies to every page and does not remove the underlying PDF content.</li>
-<li>Open <b>Rotate</b>, enter a fine angle, and click <b>Preview</b> when you want to inspect it. <b>Discard</b> clears the pending preview; <b>Apply</b> changes the PDF. The rotation toolbar's <b>This page</b> option limits rotation to the previewed page.</li>
+<li>Click <b>Crop</b> to open its controls. Draw crop boxes in the stack view. Odd/even positions stay independent while their sizes stay uniform. In a page preview, enable <b>This page only</b> to make that page differ.</li>
+<li>Click <b>Cover</b>, choose <b>All</b>, <b>Odd</b>, or <b>Even</b>, then draw a visual cover. In a page preview, <b>This page only</b> overrides that scope. New covers are added without replacing existing ones, and they do not remove the underlying PDF content.</li>
+<li>Open <b>Rotate</b>, enter a fine angle, and click <b>Preview</b> when you want to inspect it. <b>Discard</b> clears the pending preview; <b>Apply</b> changes the PDF. The rotation toolbar's <b>This page only</b> option limits rotation to the previewed page.</li>
 <li>Click a thumbnail image to preview it; click it again or use <b>Stack</b> to return. Thumbnail checkboxes select pages for deletion. Ctrl toggles pages and Shift selects a range.</li>
-<li>Crop and Cover apply to all pages; explicit crop overrides replace the stack crop only on their pages.</li>
+<li>Crop applies to all pages; explicit crop overrides replace the stack crop only on their pages. Cover uses its explicit page scope and remains additive.</li>
 <li>Use <b>Undo</b> to restore the previous crop, cover, rotation, or page deletion.</li>
 <li>Save your changes with the purple <b>Save</b> button.</li>
 </ol>"""
@@ -1005,6 +1143,8 @@ class PDFViewer(QMainWindow):
         self.preview_page_num = None
         with QSignalBlocker(self.crop_page_override_checkbox):
             self.crop_page_override_checkbox.setChecked(False)
+        with QSignalBlocker(self.cover_page_override_checkbox):
+            self.cover_page_override_checkbox.setChecked(False)
         with QSignalBlocker(self.rotation_page_override_checkbox):
             self.rotation_page_override_checkbox.setChecked(False)
         self.updateOverlay()
@@ -1105,7 +1245,8 @@ class PDFViewer(QMainWindow):
         return response == QMessageBox.StandardButton.Ok
 
     def _start_rotation_worker(self, worker, status_message):
-        self.pushUndo()
+        if self.pushUndo() is None:
+            return
         self._rotation_undo_pushed = True
         self.setUIProcessing(True)
         self._operation_id += 1
@@ -1142,7 +1283,7 @@ class PDFViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "No Rotation Target",
-                "Choose a page stack, or preview a page and enable This page.",
+                "Choose a page stack, or preview a page and enable This page only.",
             )
             return
 
@@ -1182,7 +1323,7 @@ class PDFViewer(QMainWindow):
             QMessageBox.information(
                 self,
                 "No Deskew Target",
-                "Choose a page stack, or preview a page and enable This page.",
+                "Choose a page stack, or preview a page and enable This page only.",
             )
             return
         if not self._confirm_arbitrary_rotation(target_pages):
@@ -1212,7 +1353,7 @@ class PDFViewer(QMainWindow):
         undetected = list(result.get("undetected_pages", []))
         if not rotations:
             if self._rotation_undo_pushed and self.undo_stack:
-                self.undo_stack.pop()
+                self._discardLastUndoSnapshot()
             self._rotation_undo_pushed = False
             self.pending_status_message = "No usable skew angle was detected."
             self.updateActionState()
@@ -1260,7 +1401,7 @@ class PDFViewer(QMainWindow):
         if operation_id != self._operation_id:
             return
         if self._rotation_undo_pushed and self.undo_stack:
-            self.undo_stack.pop()
+            self._discardLastUndoSnapshot()
         self._rotation_undo_pushed = False
         self.processingError(operation_id, error_str)
 
@@ -1297,6 +1438,7 @@ class PDFViewer(QMainWindow):
             if len(new_document) == 0:
                 raise ValueError("The PDF contains no pages.")
         except Exception as error:
+            LOGGER.info("Failed to load PDF %s", pdf_path, exc_info=True)
             if new_document is not None:
                 new_document.close()
             QMessageBox.critical(self, "Error", f"Failed to load PDF: {error}")
@@ -1314,9 +1456,11 @@ class PDFViewer(QMainWindow):
         self.active_crop_info = None
         self.preview_page_num = None
         self._selection_before_preview = None
+        with QSignalBlocker(self.cover_scope_combo):
+            self.cover_scope_combo.setCurrentIndex(0)
         self.rotation_scope_combo.setCurrentIndex(0)
         self.pending_status_message = ""
-        self.undo_stack = []
+        self.undo_store.clear()
         self.page_map = list(range(len(self.pdf_doc)))
         self.original_page_count = len(self.pdf_doc)
         self.cover_operations = []
@@ -1327,6 +1471,8 @@ class PDFViewer(QMainWindow):
         self.is_dirty = False
         with QSignalBlocker(self.crop_page_override_checkbox):
             self.crop_page_override_checkbox.setChecked(False)
+        with QSignalBlocker(self.cover_page_override_checkbox):
+            self.cover_page_override_checkbox.setChecked(False)
         with QSignalBlocker(self.rotation_page_override_checkbox):
             self.rotation_page_override_checkbox.setChecked(False)
         with QSignalBlocker(self.rotation_angle_spin):
@@ -1776,6 +1922,7 @@ class PDFViewer(QMainWindow):
                         return
             event.ignore()
         except Exception:
+            LOGGER.exception("Failed to inspect a drag-enter event.")
             event.ignore()
 
     def dragMoveEvent(self, event):
@@ -1791,6 +1938,7 @@ class PDFViewer(QMainWindow):
                         return
             event.ignore()
         except Exception:
+            LOGGER.exception("Failed to inspect a drag-move event.")
             event.ignore()
 
     def dropEvent(self, event):
@@ -1814,6 +1962,7 @@ class PDFViewer(QMainWindow):
                         return
             event.ignore()
         except Exception:
+            LOGGER.exception("Failed to process a PDF drop event.")
             event.ignore()
 
     def _current_image_dimensions(self):
@@ -1939,7 +2088,7 @@ class PDFViewer(QMainWindow):
         missing_pages = set(range(len(self.pdf_doc))) - set(retained_rects)
         if missing_pages:
             if self.undo_stack:
-                self.undo_stack.pop()
+                self._discardLastUndoSnapshot()
             QMessageBox.warning(
                 self,
                 "Incomplete Crop",
@@ -1968,7 +2117,7 @@ class PDFViewer(QMainWindow):
         self.reloadImages(set(crop_rects))
 
     def _target_pages_for_rectangle_request(self):
-        return list(range(len(self.pdf_doc)))
+        return self._cover_target_pages()
 
     def handleCoverRequest(self, rect):
         if self.is_processing or self.pdf_doc is None:
@@ -1985,7 +2134,10 @@ class PDFViewer(QMainWindow):
 
         target_pages = self._target_pages_for_rectangle_request()
         if not target_pages:
+            self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
             return
+        target = self._cover_target_description(target_pages)
+        self.statusBar().showMessage(f"Adding cover to {target}; existing covers remain.")
         self.applyCover(rect, target_pages)
 
     def handleWhiteoutRequest(self, rect):
@@ -2012,15 +2164,12 @@ class PDFViewer(QMainWindow):
             QMessageBox.warning(self, "Invalid Selection", f"{error!s}")
             return
 
-        before_pdf_bytes = self.pdf_doc.tobytes()
-        before_covers = [dict(operation) for operation in self.cover_operations]
-        before_dirty = self.is_dirty
+        snapshot = self.pushUndo()
+        if snapshot is None:
+            return
         try:
-            self.statusBar().showMessage(
-                f"Applying cover to {len(target_pages)} page"
-                f"{'s' if len(target_pages) != 1 else ''}..."
-            )
-            self.pushUndo(pdf_bytes=before_pdf_bytes)
+            target = self._cover_target_description(target_pages)
+            self.statusBar().showMessage(f"Adding cover to {target}; existing covers remain.")
 
             for page_num in target_pages:
                 page = self.pdf_doc[page_num]
@@ -2042,19 +2191,24 @@ class PDFViewer(QMainWindow):
                 operation["color"] = [round(float(value), 4) for value in self.cover_color]
                 self.cover_operations.append(operation)
 
-            self.pending_status_message = (
-                f"Cover applied to {len(target_pages)} page{'s' if len(target_pages) != 1 else ''}."
-            )
+            self.pending_status_message = f"Cover added to {target}; existing covers remain."
             self._refresh_dirty_state()
             self.reloadImages(target_pages)
         except Exception as error:
-            self.pdf_doc.close()
-            self.pdf_doc = fitz.open("pdf", before_pdf_bytes)
-            self.cover_operations = before_covers
-            self.is_dirty = before_dirty
-            if self.undo_stack:
-                self.undo_stack.pop()
-            QMessageBox.critical(self, "Error", f"Failed to apply cover: {error!s}")
+            LOGGER.exception("Failed to apply a Cover operation.")
+            restored = self._rollbackUndoSnapshot(snapshot)
+            if restored and not self.is_processing:
+                self.reloadImages()
+            recovery = (
+                "The previous document state was restored."
+                if restored
+                else "Automatic recovery failed; use Undo to restore the previous state."
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to apply cover: {error!s}\n\n{recovery}",
+            )
 
     def deleteSelectedPages(self):
         if self.pdf_doc is None:
@@ -2069,8 +2223,10 @@ class PDFViewer(QMainWindow):
             QMessageBox.warning(self, "Warning", "A PDF must retain at least one page.")
             return
 
+        snapshot = self.pushUndo()
+        if snapshot is None:
+            return
         try:
-            self.pushUndo()  # Save state before modification
             self.invalidate_pixmap_cache()
             old_canvas = self._stack_canvas_dimensions()
 
@@ -2092,6 +2248,8 @@ class PDFViewer(QMainWindow):
                 if self.preview_page_num is None:
                     with QSignalBlocker(self.crop_page_override_checkbox):
                         self.crop_page_override_checkbox.setChecked(False)
+                    with QSignalBlocker(self.cover_page_override_checkbox):
+                        self.cover_page_override_checkbox.setChecked(False)
                     with QSignalBlocker(self.rotation_page_override_checkbox):
                         self.rotation_page_override_checkbox.setChecked(False)
 
@@ -2138,7 +2296,20 @@ class PDFViewer(QMainWindow):
                 6000,
             )
         except Exception as error:
-            QMessageBox.critical(self, "Error", f"Failed to delete pages: {error!s}")
+            LOGGER.exception("Failed to delete selected pages.")
+            restored = self._rollbackUndoSnapshot(snapshot)
+            if restored and not self.is_processing:
+                self.reloadImages()
+            recovery = (
+                "The previous document state was restored."
+                if restored
+                else "Automatic recovery failed; use Undo to restore the previous state."
+            )
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to delete pages: {error!s}\n\n{recovery}",
+            )
 
     def savePDF(self):
         if self.is_processing or self.pdf_doc is None:
@@ -2172,13 +2343,16 @@ class PDFViewer(QMainWindow):
         self._operation_id += 1
         operation_id = self._operation_id
         self.statusBar().showMessage("Saving PDF and provenance manifest...")
-        deflate_enabled = not self.fast_save_action.isChecked()
+        fast_save_enabled = self.fast_save_action.isChecked()
+        deflate_enabled = not fast_save_enabled
+        garbage_level = 1 if fast_save_enabled else 2
         manifest_path = self.manifest_path or f"{save_path}.pycroppdf.json"
         worker = SaveWorker(
             pdf_bytes,
             save_path,
             self.active_crop_info,
             deflate=deflate_enabled,
+            garbage=garbage_level,
             source_path=self.original_pdf_path or self.pdf_path,
             manifest_path=manifest_path,
             page_map=self.page_map,
@@ -2207,6 +2381,12 @@ class PDFViewer(QMainWindow):
         self.cover_tool_btn.setEnabled(cover_available)
         self.cover_color_btn.setEnabled(cover_available)
         self.pick_cover_color_btn.setEnabled(cover_available)
+        self.cover_scope_combo.setEnabled(
+            cover_available and not self._per_page_cover_override_enabled()
+        )
+        self.cover_page_override_checkbox.setEnabled(
+            cover_available and self.preview_page_num is not None
+        )
         self.crop_btn.setEnabled(coordinate_tools_available and self.active_tool == "crop")
         self.reset_crop_btn.setEnabled(available and bool(self.active_crop_info))
         rotation_available = available and not self.active_crop_info
@@ -2241,7 +2421,7 @@ class PDFViewer(QMainWindow):
         )
         self.delete_btn.setEnabled(available and bool(self.selected_pages))
         self.view_stack_btn.setEnabled(available and self.preview_page_num is not None)
-        self.rotation_options_toggle_btn.setEnabled(available)
+        self.rotation_options_toggle_btn.setEnabled(rotation_available)
         self.undo_btn.setEnabled(available and bool(self.undo_stack))
         self.undo_action.setEnabled(available and bool(self.undo_stack))
         self.save_btn.setEnabled(available)
@@ -2336,5 +2516,6 @@ class PDFViewer(QMainWindow):
             return
         if self.pdf_doc is not None:
             self.pdf_doc.close()
+        self.undo_store.close()
         QApplication.instance().removeEventFilter(self)
         super().closeEvent(event)

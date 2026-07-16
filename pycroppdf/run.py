@@ -20,13 +20,18 @@ def main():
     args = parser.parse_args()
 
     if args.check_deskew:
-        from .rotation import deskew_available
+        from .rotation import _deskew_dependencies
 
-        if deskew_available():
-            print("deskew runtime available")
-            return
-        print("deskew runtime unavailable", file=sys.stderr)
-        raise SystemExit(2)
+        try:
+            _deskew_dependencies()
+        except Exception as error:
+            print(
+                f"deskew runtime unavailable: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from error
+        print("deskew runtime available")
+        return
 
     if args.check_deskew_workers:
         import fitz

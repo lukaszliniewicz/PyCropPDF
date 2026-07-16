@@ -261,6 +261,35 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertFalse(hasattr(self.viewer, "redact_btn"))
         self.assertFalse(hasattr(self.viewer, "applyRedaction"))
 
+    def test_fast_save_uses_safe_minimal_garbage_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            document = fitz.open()
+            document.new_page(width=300, height=400)
+            self.viewer.pdf_doc = document
+            self.viewer.pdf_path = os.path.join(directory, "source.pdf")
+            self.viewer.original_pdf_path = self.viewer.pdf_path
+            self.viewer.save_directory = directory
+            self.viewer.save_filename = "output.pdf"
+
+            with (
+                patch("pycroppdf.main_window.SaveWorker") as save_worker,
+                patch.object(self.viewer.threadpool, "start"),
+            ):
+                self.viewer.fast_save_action.setChecked(True)
+                self.viewer.savePDF()
+                fast_kwargs = save_worker.call_args.kwargs
+                self.assertFalse(fast_kwargs["deflate"])
+                self.assertEqual(fast_kwargs["garbage"], 1)
+
+                self.viewer.setUIProcessing(False)
+                self.viewer.fast_save_action.setChecked(False)
+                self.viewer.savePDF()
+                compressed_kwargs = save_worker.call_args.kwargs
+                self.assertTrue(compressed_kwargs["deflate"])
+                self.assertEqual(compressed_kwargs["garbage"], 2)
+
+                self.viewer.setUIProcessing(False)
+
     def test_cover_uses_the_chosen_color(self):
         document = fitz.open()
         document.new_page(width=300, height=400)
@@ -527,7 +556,7 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertNotAlmostEqual(page_override.width, stack_crop.width)
         self.assertNotAlmostEqual(page_override.height, stack_crop.height)
 
-    def test_edit_toolbars_are_contextual_and_rotation_expands_independently(self):
+    def test_edit_toolbars_share_one_contextual_row(self):
         document = fitz.open()
         document.new_page()
         self.viewer.pdf_doc = document
@@ -546,14 +575,39 @@ class ViewerRegressionTests(unittest.TestCase):
         self.viewer.onColorPicked(QColor(20, 40, 60))
         self.assertTrue(all(view._tool == "cover" for view in self._page_views()))
 
-        self.viewer.rotation_options_toggle_btn.setChecked(True)
-        self.assertFalse(self.viewer.cover_toolbar.isHidden())
+        self.viewer.rotation_options_toggle_btn.click()
+        self.assertEqual(self.viewer.active_tool, "rotate")
+        self.assertTrue(self.viewer.crop_toolbar.isHidden())
+        self.assertTrue(self.viewer.cover_toolbar.isHidden())
         self.assertFalse(self.viewer.rotation_toolbar.isHidden())
 
         self.viewer.crop_tool_btn.click()
+        self.assertEqual(self.viewer.active_tool, "crop")
         self.assertFalse(self.viewer.crop_toolbar.isHidden())
         self.assertTrue(self.viewer.cover_toolbar.isHidden())
-        self.assertFalse(self.viewer.rotation_toolbar.isHidden())
+        self.assertTrue(self.viewer.rotation_toolbar.isHidden())
+
+        toolbars = (
+            self.viewer.crop_toolbar,
+            self.viewer.cover_toolbar,
+            self.viewer.rotation_toolbar,
+        )
+        self.assertEqual(sum(not toolbar.isHidden() for toolbar in toolbars), 1)
+
+    def test_page_only_controls_use_consistent_label(self):
+        controls = (
+            self.viewer.crop_page_override_checkbox,
+            self.viewer.cover_page_override_checkbox,
+            self.viewer.rotation_page_override_checkbox,
+        )
+        self.assertEqual({control.text() for control in controls}, {"This page only"})
+        self.assertEqual(
+            [
+                self.viewer.cover_scope_combo.itemText(index)
+                for index in range(self.viewer.cover_scope_combo.count())
+            ],
+            ["All", "Odd", "Even"],
+        )
 
     def test_toolbar_controls_use_one_height(self):
         controls = (
@@ -569,6 +623,8 @@ class ViewerRegressionTests(unittest.TestCase):
             self.viewer.crop_page_override_checkbox,
             self.viewer.cover_color_btn,
             self.viewer.pick_cover_color_btn,
+            self.viewer.cover_scope_combo,
+            self.viewer.cover_page_override_checkbox,
             self.viewer.cover_note_label,
             self.viewer.rotation_page_override_checkbox,
             self.viewer.rotation_scope_combo,
@@ -588,7 +644,7 @@ class ViewerRegressionTests(unittest.TestCase):
         self.viewer.pdf_doc = document
         self.viewer.images = [QImage(100, 100, QImage.Format.Format_RGB888)]
         self.viewer.updateActionState()
-        self.viewer.rotation_options_toggle_btn.setChecked(True)
+        self.viewer.rotation_options_toggle_btn.click()
         self.viewer.showNormal()
         self.viewer.resize(1100, 800)
         self.app.processEvents()
@@ -604,6 +660,7 @@ class ViewerRegressionTests(unittest.TestCase):
 
         self.viewer.cover_tool_btn.click()
         self.app.processEvents()
+        self.assertTrue(self.viewer.save_btn.isVisible())
         extension = self.viewer.cover_toolbar.findChild(QToolButton, "qt_toolbar_ext_button")
         self.assertFalse(extension and extension.isVisible())
 

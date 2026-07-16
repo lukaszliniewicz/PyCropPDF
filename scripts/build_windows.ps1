@@ -11,6 +11,18 @@ $work = Join-Path $repo "build\pyinstaller\$Name"
 $spec = Join-Path $work "spec"
 New-Item -ItemType Directory -Force -Path $work, $spec | Out-Null
 
+$pythonPrefix = (& $Python -c "import sys; print(sys.prefix)").Trim()
+if ($LASTEXITCODE -ne 0 -or -not $pythonPrefix) {
+    throw "Could not determine the selected Python environment."
+}
+$runtimePaths = @(
+    $pythonPrefix,
+    (Join-Path $pythonPrefix "Library\bin"),
+    (Join-Path $pythonPrefix "DLLs")
+) | Where-Object { Test-Path -LiteralPath $_ }
+$originalPath = $env:PATH
+$env:PATH = (($runtimePaths + $originalPath) -join [System.IO.Path]::PathSeparator)
+
 Push-Location $repo
 try {
     & $Python -m PyInstaller `
@@ -19,6 +31,7 @@ try {
         --onefile `
         --noconsole `
         --additional-hooks-dir $hooks `
+        --hidden-import deskew `
         --name $Name `
         --distpath $DistPath `
         --workpath $work `
@@ -29,5 +42,6 @@ try {
     }
 }
 finally {
+    $env:PATH = $originalPath
     Pop-Location
 }

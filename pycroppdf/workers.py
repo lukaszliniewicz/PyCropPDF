@@ -361,6 +361,7 @@ class SaveWorker(QRunnable):
         save_path: str,
         crop_info: dict | None = None,
         deflate: bool = False,
+        garbage: int = 2,
         source_path: str | None = None,
         manifest_path: str | None = None,
         page_map: Iterable[int] | None = None,
@@ -376,6 +377,9 @@ class SaveWorker(QRunnable):
         self.save_path = save_path
         self.crop_info = crop_info or {}
         self.deflate = deflate
+        self.garbage = int(garbage)
+        if self.garbage not in range(5):
+            raise ValueError("PDF garbage collection must be between 0 and 4.")
         self.source_path = source_path
         self.manifest_path = manifest_path
         self.page_map = list(page_map or [])
@@ -419,7 +423,11 @@ class SaveWorker(QRunnable):
                 )
 
             pdf_temporary_path = _temporary_output_path(output_directory, ".pdf")
-            document.save(pdf_temporary_path, garbage=2, deflate=self.deflate)
+            document.save(
+                pdf_temporary_path,
+                garbage=self.garbage,
+                deflate=self.deflate,
+            )
             document.close()
             document = None
 

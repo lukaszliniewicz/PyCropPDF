@@ -11,10 +11,11 @@ import fitz
 from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtGui import QImage
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from pycroppdf.main_window import PDFViewer
 from pycroppdf.state import (
+    UndoSnapshotStore,
     clone_crop_info,
     remap_crop_info_after_deletions,
     remap_page_indices_after_deletions,
@@ -24,6 +25,45 @@ from pycroppdf.workers import SaveWorker
 
 
 class StateHelpersTests(unittest.TestCase):
+    def test_undo_snapshot_store_enforces_count_and_disk_limits(self):
+        document = fitz.open()
+        document.new_page(width=300, height=400)
+
+        count_store = UndoSnapshotStore(max_entries=2, max_disk_bytes=1024 * 1024)
+        count_paths = []
+        try:
+            for _ in range(3):
+                path, size = count_store.write_document(document)
+                count_paths.append(path)
+                count_store.append({"pdf_path": path, "pdf_size": size})
+            self.assertEqual(len(count_store.entries), 2)
+            self.assertFalse(os.path.exists(count_paths[0]))
+            self.assertTrue(all(os.path.exists(path) for path in count_paths[1:]))
+        finally:
+            count_store.close()
+
+        disk_store = UndoSnapshotStore(max_entries=10, max_disk_bytes=1)
+        disk_paths = []
+        try:
+            disk_store.append({"pdf_path": None, "pdf_size": 0, "kind": "too-old"})
+            path, size = disk_store.write_document(document)
+            disk_paths.append(path)
+            disk_store.append({"pdf_path": path, "pdf_size": size})
+            disk_store.append({"pdf_path": None, "pdf_size": 0, "kind": "metadata"})
+            self.assertEqual(len(disk_store.entries), 3)
+            self.assertTrue(os.path.exists(disk_paths[0]))
+
+            path, size = disk_store.write_document(document)
+            disk_paths.append(path)
+            disk_store.append({"pdf_path": path, "pdf_size": size})
+            self.assertEqual(len(disk_store.entries), 2)
+            self.assertFalse(os.path.exists(disk_paths[0]))
+            self.assertTrue(os.path.exists(disk_paths[1]))
+            self.assertEqual(disk_store.entries[0]["kind"], "metadata")
+        finally:
+            disk_store.close()
+            document.close()
+
     def test_crop_rectangles_and_page_indices_remap_after_deletions(self):
         crop_info = {
             "view_mode": "odd_even",
@@ -178,16 +218,52 @@ class ViewerInteractionTests(unittest.TestCase):
 
             self.viewer.loadPDF(source_path)
             self._wait_for_processing()
-            self.viewer.applyCover(QRectF(10, 10, 40, 30), [0])
+            self.viewer.applyCover(QRectF(10, 10, 40, 30), [0, 1])
             self._wait_for_processing()
 
-            self.assertEqual(len(self.viewer.cover_operations), 1)
+            self.viewer.applyCover(QRectF(60, 60, 30, 20), [0])
+            self._wait_for_processing()
+
+            self.assertEqual(
+                [operation["output_page"] for operation in self.viewer.cover_operations],
+                [1, 2, 1],
+            )
+            self.assertEqual(
+                self.viewer.statusBar().currentMessage(),
+                "Cover added to page 1; existing covers remain.",
+            )
             self.assertIsNone(QApplication.overrideCursor())
+
+            self.viewer.undo()
+            self._wait_for_processing()
+            self.assertEqual(
+                [operation["output_page"] for operation in self.viewer.cover_operations],
+                [1, 2],
+            )
 
             self.viewer.undo()
             self._wait_for_processing()
             self.assertEqual(self.viewer.cover_operations, [])
             self.assertIsNone(QApplication.overrideCursor())
+
+    def test_cover_empty_scope_is_reported_without_starting_an_operation(self):
+        document = fitz.open()
+        document.new_page(width=300, height=400)
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0]
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888)]
+        self.viewer.cover_scope_combo.setCurrentIndex(
+            self.viewer.cover_scope_combo.findData("even")
+        )
+
+        with patch.object(self.viewer, "applyCover") as apply_cover:
+            self.viewer.handleCoverRequest(QRectF(10, 10, 20, 20))
+
+        apply_cover.assert_not_called()
+        self.assertEqual(
+            self.viewer.statusBar().currentMessage(),
+            "The selected Cover scope contains no pages.",
+        )
 
     def test_edit_operations_ignore_thumbnail_selection_and_follow_view_scope(self):
         document = fitz.open()
@@ -203,11 +279,28 @@ class ViewerInteractionTests(unittest.TestCase):
         with patch.object(self.viewer, "reloadImages"):
             self.viewer.cropSelection()
         self.assertEqual(set(self.viewer.active_crop_info["rects"]), {0, 1, 2})
-        self.assertIsNone(self.viewer.undo_stack[-1]["pdf_bytes"])
+        self.assertIsNone(self.viewer.undo_stack[-1]["pdf_path"])
 
         self.viewer.active_crop_info = None
         self.viewer.selected_pages = {0, 2}
         self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
+
+        self.viewer.cover_scope_combo.setCurrentIndex(self.viewer.cover_scope_combo.findData("odd"))
+        self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 2])
+        with patch.object(self.viewer, "applyCover") as apply_cover:
+            self.viewer.handleCoverRequest(QRectF(10, 10, 20, 20))
+        apply_cover.assert_called_once_with(QRectF(10, 10, 20, 20), [0, 2])
+        self.assertEqual(
+            self.viewer.statusBar().currentMessage(),
+            "Adding cover to 2 odd pages; existing covers remain.",
+        )
+
+        self.viewer.cover_scope_combo.setCurrentIndex(
+            self.viewer.cover_scope_combo.findData("even")
+        )
+        self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [1])
+
+        self.viewer.cover_scope_combo.setCurrentIndex(self.viewer.cover_scope_combo.findData("all"))
 
         with patch.object(self.viewer, "applyCover") as apply_cover:
             self.viewer.handleCoverRequest(QRectF(10, 10, 20, 20))
@@ -215,6 +308,18 @@ class ViewerInteractionTests(unittest.TestCase):
 
         self.viewer.preview_page_num = 1
         self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
+        self.viewer.cover_page_override_checkbox.setChecked(True)
+        self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [1])
+        self.assertFalse(self.viewer.cover_scope_combo.isEnabled())
+        with patch.object(self.viewer, "applyCover") as apply_cover:
+            self.viewer.handleCoverRequest(QRectF(15, 15, 25, 25))
+        apply_cover.assert_called_once_with(QRectF(15, 15, 25, 25), [1])
+        self.assertEqual(
+            self.viewer.statusBar().currentMessage(),
+            "Adding cover to page 2; existing covers remain.",
+        )
+        self.viewer.cover_page_override_checkbox.setChecked(False)
+        self.assertTrue(self.viewer.cover_scope_combo.isEnabled())
         self.viewer.single_view.setSelection(QRectF(10, 10, 200, 300))
         with patch.object(self.viewer, "reloadImages"):
             self.viewer.cropSelection()
@@ -246,7 +351,11 @@ class ViewerInteractionTests(unittest.TestCase):
         self.viewer.selected_pages = {1, 2}
         self.viewer.selection_anchor = 1
         self.viewer.preview_page_num = 2
-        self.viewer.pushUndo()
+        self.viewer.cover_page_override_checkbox.setChecked(True)
+        snapshot = self.viewer.pushUndo()
+        snapshot_path = snapshot["pdf_path"]
+        self.assertNotIn("pdf_bytes", snapshot)
+        self.assertTrue(os.path.isfile(snapshot_path))
 
         self.viewer.pdf_doc.delete_page(1)
         self.viewer.page_map = [0, 2]
@@ -255,9 +364,12 @@ class ViewerInteractionTests(unittest.TestCase):
         self.viewer.rotation_operations = []
         self.viewer.selected_pages = set()
         self.viewer.preview_page_num = None
+        self.viewer.cover_page_override_checkbox.setChecked(False)
 
         with patch.object(self.viewer, "reloadImages"):
             self.viewer.undo()
+
+        self.assertFalse(os.path.exists(snapshot_path))
 
         self.assertEqual(len(self.viewer.pdf_doc), 3)
         self.assertEqual(self.viewer.page_map, [0, 1, 2])
@@ -267,6 +379,58 @@ class ViewerInteractionTests(unittest.TestCase):
         self.assertEqual(self.viewer.selected_pages, {1, 2})
         self.assertEqual(self.viewer.selection_anchor, 1)
         self.assertEqual(self.viewer.preview_page_num, 2)
+        self.assertTrue(self.viewer.cover_page_override_checkbox.isChecked())
+
+    def test_cover_failure_restores_document_and_does_not_leave_undo_entry(self):
+        document = fitz.open()
+        document.new_page(width=300, height=400)
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0]
+        self.viewer.original_page_count = 1
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888)]
+
+        with (
+            patch.object(
+                self.viewer,
+                "_refresh_dirty_state",
+                side_effect=RuntimeError("synthetic cover failure"),
+            ),
+            patch.object(QMessageBox, "critical"),
+        ):
+            self.viewer.applyCover(QRectF(20, 20, 40, 30), [0])
+        self._wait_for_processing()
+
+        self.assertEqual(self.viewer.cover_operations, [])
+        self.assertEqual(self.viewer.pdf_doc[0].get_drawings(), [])
+        self.assertEqual(self.viewer.undo_stack, [])
+        self.assertFalse(self.viewer.is_dirty)
+
+    def test_page_deletion_failure_restores_document_and_page_state(self):
+        document = fitz.open()
+        for _ in range(3):
+            document.new_page(width=300, height=400)
+        self.viewer.pdf_doc = document
+        self.viewer.page_map = [0, 1, 2]
+        self.viewer.original_page_count = 3
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888) for _ in range(3)]
+        self.viewer.selected_pages = {1}
+
+        with (
+            patch.object(
+                self.viewer,
+                "_stack_canvas_dimensions",
+                side_effect=[(300, 400), RuntimeError("synthetic deletion failure")],
+            ),
+            patch.object(QMessageBox, "critical"),
+        ):
+            self.viewer.deleteSelectedPages()
+        self._wait_for_processing()
+
+        self.assertEqual(len(self.viewer.pdf_doc), 3)
+        self.assertEqual(self.viewer.page_map, [0, 1, 2])
+        self.assertEqual(self.viewer.selected_pages, {1})
+        self.assertEqual(len(self.viewer.images), 3)
+        self.assertEqual(self.viewer.undo_stack, [])
 
     def test_clone_crop_info_does_not_share_rectangles(self):
         original = {
