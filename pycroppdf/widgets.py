@@ -14,8 +14,7 @@ from PyQt6.QtWidgets import (
 class PageGraphicsView(QGraphicsView):
     selectionChanged = pyqtSignal(QRectF)
     colorPicked = pyqtSignal(QColor)
-    whiteoutRequested = pyqtSignal(QRectF)
-    redactionRequested = pyqtSignal(QRectF)
+    coverRequested = pyqtSignal(QRectF)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -28,9 +27,10 @@ class PageGraphicsView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._mode = "none"  # 'none', 'draw', 'move', 'resize'
-        self._tool = "select"  # 'select', 'whiteout', 'pick_color'
+        self._tool = "select"  # 'select', 'cover', 'pick_color'
         self._resize_handle = None
         self._start_pos = None
         self._original_rect = None
@@ -43,29 +43,40 @@ class PageGraphicsView(QGraphicsView):
 
     def setTool(self, tool):
         self._tool = tool
-        if tool in ["pick_color", "whiteout", "redact"]:
-            self.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._restore_tool_cursor()
 
         if tool != "select":
             self.clearSelection()
 
+    def _restore_tool_cursor(self):
+        if self._pan:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self._tool in ["pick_color", "cover"]:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def setPanActive(self, active):
+        """Enable temporary space-bar panning without changing the active tool."""
+        self._pan = bool(active)
+        self._restore_tool_cursor()
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            self._pan = True
-            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.setPanActive(True)
+            event.accept()
         else:
             super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            self._pan = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)  # Will be updated by mouseMoveEvent
+            self.setPanActive(False)
+            event.accept()
         else:
             super().keyReleaseEvent(event)
 
     def wheelEvent(self, event):
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         zoom_factor = 1.15
         if event.angleDelta().y() < 0:
             zoom_factor = 1.0 / zoom_factor
@@ -129,7 +140,7 @@ class PageGraphicsView(QGraphicsView):
                 self._last_pan_pos = event.pos()
                 return
 
-            if self._tool in {"whiteout", "redact"}:
+            if self._tool == "cover":
                 pos = self.mapToScene(event.pos())
                 self._start_pos = pos
                 self._mode = "draw"
@@ -187,8 +198,7 @@ class PageGraphicsView(QGraphicsView):
         elif self._mode == "draw":
             rect = QRectF(self._start_pos, pos).normalized()
             if not self.selection_item:
-                color = QColor("#d32f2f") if self._tool == "redact" else QColor("#ef5350")
-                pen = QPen(color, 2, Qt.PenStyle.SolidLine)
+                pen = QPen(QColor("#ef5350"), 2, Qt.PenStyle.SolidLine)
                 self.selection_item = self.scene.addRect(rect, pen)
             else:
                 self.selection_item.setRect(rect)
@@ -219,13 +229,10 @@ class PageGraphicsView(QGraphicsView):
                 self.setCursor(Qt.CursorShape.OpenHandCursor)
                 return
 
-            if self._tool in {"whiteout", "redact"} and self._mode == "draw":
+            if self._tool == "cover" and self._mode == "draw":
                 rect = QRectF(self._start_pos, self.mapToScene(event.pos())).normalized()
                 if rect.isValid() and not rect.isNull():
-                    if self._tool == "redact":
-                        self.redactionRequested.emit(rect)
-                    else:
-                        self.whiteoutRequested.emit(rect)
+                    self.coverRequested.emit(rect)
 
                 # Cleanup drawing artifact
                 if self.selection_item:
@@ -280,10 +287,11 @@ class PageGraphicsView(QGraphicsView):
 
 class ThumbnailWidget(QWidget):
     previewRequested = pyqtSignal(int)
-    selectionRequested = pyqtSignal(int, object)
+    selectionRequested = pyqtSignal(int, object, bool)
 
     def __init__(self, page_num, image, parent=None):
         super().__init__(parent)
+        self.setMaximumWidth(90)
         layout = QVBoxLayout()
         layout.setSpacing(2)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -320,21 +328,22 @@ class ThumbnailWidget(QWidget):
     def eventFilter(self, source, event):
         if source == self.label and event.type() == QEvent.Type.MouseButtonPress:
             modifiers = event.modifiers()
-            self.selectionRequested.emit(self.page_num, modifiers)
             range_modifiers = (
                 Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
             )
-            if not modifiers & range_modifiers:
+            if modifiers & range_modifiers:
+                self.selectionRequested.emit(self.page_num, modifiers, True)
+            else:
                 self.previewRequested.emit(self.page_num)
             return True
         return super().eventFilter(source, event)
 
     def _request_selection(self):
-        self.selectionRequested.emit(self.page_num, QApplication.keyboardModifiers())
+        self.selectionRequested.emit(self.page_num, QApplication.keyboardModifiers(), True)
 
     def _refresh_highlight(self):
         if self._selected_for_preview:
-            self.label.setStyleSheet("border: 2px solid #7e57c2;")
+            self.label.setStyleSheet("border: 3px solid #7e57c2;")
         elif self._selected_for_deletion:
             self.label.setStyleSheet("border: 2px dashed #9575cd;")
         else:

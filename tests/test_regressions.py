@@ -8,13 +8,18 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import fitz
-from PyQt6.QtCore import QMimeData, QPointF, QRectF, Qt, QUrl
-from PyQt6.QtGui import QDropEvent, QImage
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtCore import QEvent, QMimeData, QPointF, QRectF, QSize, QSizeF, Qt, QUrl
+from PyQt6.QtGui import QColor, QDropEvent, QImage, QKeyEvent
+from PyQt6.QtWidgets import QApplication, QMessageBox, QToolButton
 
-from pycroppdf.main_window import PDFViewer
+from pycroppdf.main_window import TOOLBAR_CONTROL_HEIGHT, PDFViewer
 from pycroppdf.provenance import sha256_bytes
-from pycroppdf.workers import RenderAllPagesWorker, SaveWorker, scene_rect_to_pdf_coords
+from pycroppdf.workers import (
+    RenderAllPagesWorker,
+    SaveWorker,
+    pdf_rect_to_scene_coords,
+    scene_rect_to_pdf_coords,
+)
 
 
 class CoordinateRegressionTests(unittest.TestCase):
@@ -70,6 +75,39 @@ class CoordinateRegressionTests(unittest.TestCase):
         page.draw_rect(mask_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
 
         self.assertEqual(tuple(page.get_drawings()[-1]["rect"]), (100.0, 100.0, 200.0, 200.0))
+        document.close()
+
+    def test_stack_and_page_scene_coordinates_round_trip_through_pdf_space(self):
+        document = fitz.open()
+        page = document.new_page(width=300, height=400)
+        preview = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+        stack_canvas = (700, 900)
+        stack_rect = QRectF(170, 190, 240, 300)
+
+        pdf_rect = scene_rect_to_pdf_coords(
+            stack_rect,
+            (preview.width, preview.height),
+            stack_canvas,
+            page,
+            page.cropbox,
+        )
+        page_rect = pdf_rect_to_scene_coords(
+            pdf_rect,
+            (preview.width, preview.height),
+            (preview.width, preview.height),
+            page,
+            page.cropbox,
+        )
+        round_trip = scene_rect_to_pdf_coords(
+            page_rect,
+            (preview.width, preview.height),
+            (preview.width, preview.height),
+            page,
+            page.cropbox,
+        )
+
+        for actual, expected in zip(round_trip, pdf_rect, strict=True):
+            self.assertAlmostEqual(actual, expected, places=5)
         document.close()
 
 
@@ -156,7 +194,7 @@ class SaveAndProvenanceRegressionTests(unittest.TestCase):
 
             with open(manifest_path, encoding="utf-8") as manifest_file:
                 manifest = json.load(manifest_file)
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"], 3)
             self.assertEqual(manifest["redactions"][0]["output_page"], 1)
 
 
@@ -208,7 +246,7 @@ class ViewerRegressionTests(unittest.TestCase):
         self.app.processEvents()
         self.show_maximized_patch.stop()
 
-    def test_redaction_removes_text_while_visual_masks_remain_non_destructive(self):
+    def test_cover_is_non_destructive_and_redaction_is_not_exposed(self):
         document = fitz.open()
         page = document.new_page(width=300, height=400)
         page.insert_text((100, 100), "SECRET")
@@ -218,17 +256,159 @@ class ViewerRegressionTests(unittest.TestCase):
         self.viewer.original_page_count = 1
 
         with patch.object(self.viewer, "reloadImages"):
-            self.viewer.applyWhiteout(QRectF(70, 70, 100, 60), [0])
+            self.viewer.applyCover(QRectF(70, 70, 100, 60), [0])
         self.assertIn("SECRET", page.get_text())
+        self.assertFalse(hasattr(self.viewer, "redact_btn"))
+        self.assertFalse(hasattr(self.viewer, "applyRedaction"))
 
+    def test_cover_uses_the_chosen_color(self):
+        document = fitz.open()
+        document.new_page(width=300, height=400)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888)]
+        self.viewer.page_map = [0]
+        self.viewer.original_page_count = 1
+
+        self.viewer.onColorPicked(QColor(235, 70, 45))
         with patch.object(self.viewer, "reloadImages"):
-            self.viewer.undo()
-        with patch.object(self.viewer, "reloadImages") as reload_images:
-            self.viewer.applyRedaction(QRectF(70, 70, 100, 60), [0])
-        reload_images.assert_called_once_with((0,))
-        self.assertNotIn("SECRET", self.viewer.pdf_doc[0].get_text())
+            self.viewer.applyCover(QRectF(30, 30, 60, 60), [0])
+
+        pixmap = self.viewer.pdf_doc[0].get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
+        red, green, blue = pixmap.pixel(50, 50)[:3]
+        self.assertGreater(red, 220)
+        self.assertLess(green, 90)
+        self.assertLess(blue, 70)
+        self.assertEqual(self.viewer.cover_operations[-1]["color"], [0.9216, 0.2745, 0.1765])
+
+    def test_stack_crop_maps_to_page_preview_and_back_after_deletion(self):
+        document = fitz.open()
+        for width, height in ((400, 600), (300, 500), (200, 400)):
+            document.new_page(width=width, height=height)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [
+            QImage(400, 600, QImage.Format.Format_RGB888),
+            QImage(300, 500, QImage.Format.Format_RGB888),
+            QImage(200, 400, QImage.Format.Format_RGB888),
+        ]
+        self.viewer.page_map = [0, 1, 2]
+        self.viewer.original_page_count = 3
+        self.viewer.updateOverlay()
+        self.viewer.odd_view.setSelection(QRectF(60, 70, 120, 180))
+        self.viewer.even_view.setSelection(QRectF(150, 110, 120, 180))
+
+        self.viewer.togglePagePreview(1)
+        preview_rect = self.viewer.single_view.getSelectionRect()
+        stack_pdf_rect = self.viewer._scene_rect_to_pdf_rect(
+            self.viewer.even_view.getSelectionRect(),
+            1,
+            self.viewer._stack_canvas_dimensions(),
+        )
+        preview_pdf_rect = self.viewer._scene_rect_to_pdf_rect(
+            preview_rect,
+            1,
+            self.viewer._page_canvas_dimensions(1),
+        )
+        for actual, expected in zip(preview_pdf_rect, stack_pdf_rect, strict=True):
+            self.assertAlmostEqual(actual, expected, places=5)
+
+        self.viewer.selected_pages = {0}
+        self.viewer.deleteSelectedPages()
+        self.assertEqual(self.viewer.preview_page_num, 0)
+        preview_rect = self.viewer.single_view.getSelectionRect()
+        stack_pdf_rect = self.viewer._scene_rect_to_pdf_rect(
+            self.viewer.odd_view.getSelectionRect(),
+            0,
+            self.viewer._stack_canvas_dimensions(),
+        )
+        preview_pdf_rect = self.viewer._scene_rect_to_pdf_rect(
+            preview_rect,
+            0,
+            self.viewer._page_canvas_dimensions(0),
+        )
+        for actual, expected in zip(preview_pdf_rect, stack_pdf_rect, strict=True):
+            self.assertAlmostEqual(actual, expected, places=5)
+
+    def test_active_preview_and_page_selection_are_independent(self):
+        document = fitz.open()
+        for _ in range(3):
+            document.new_page(width=300, height=400)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(300, 400, QImage.Format.Format_RGB888) for _ in range(3)]
+        self.viewer.page_map = [0, 1, 2]
+        self.viewer.togglePagePreview(1)
+
+        self.assertEqual(self.viewer.preview_page_num, 1)
+        self.assertEqual(self.viewer.selected_pages, set())
+        self.viewer.handleThumbnailSelection(1, Qt.KeyboardModifier.NoModifier, True)
+        self.assertEqual(self.viewer.selected_pages, {1})
+        self.viewer.handleThumbnailSelection(1, Qt.KeyboardModifier.NoModifier, True)
+        self.assertEqual(self.viewer.selected_pages, set())
+        self.assertEqual(self.viewer.preview_page_num, 1)
+        self.viewer.view_stack_btn.click()
+        self.assertIsNone(self.viewer.preview_page_num)
+
+    def test_rotation_preview_requires_preview_and_can_be_discarded(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(400, 600, QImage.Format.Format_RGB888)]
+        self.viewer.setViewMode("all")
+
+        with patch.object(self.viewer.threadpool, "start") as start:
+            self.viewer.rotation_angle_spin.setValue(4.0)
+
+        start.assert_not_called()
+        self.assertEqual(self.viewer._rotation_preview_angle, 0.0)
+        self.assertEqual(self.viewer.single_view.sceneRect().width(), 400)
+        self.assertTrue(self.viewer.crop_btn.isEnabled())
+
+        self.viewer.preview_rotation_btn.click()
+        self.assertEqual(self.viewer._rotation_preview_angle, 4.0)
+        self.assertEqual(self.viewer.pdf_doc[0].rotation, 0)
+        self.assertGreater(self.viewer.single_view.sceneRect().width(), 400)
+        self.assertFalse(self.viewer.crop_btn.isEnabled())
+
+        self.viewer.rotation_angle_spin.setValue(5.0)
+        self.assertEqual(self.viewer._rotation_preview_angle, 0.0)
+        self.assertEqual(self.viewer.single_view.sceneRect().width(), 400)
+        self.viewer.preview_rotation_btn.click()
+        self.assertEqual(self.viewer._rotation_preview_angle, 5.0)
+
+        self.viewer.discard_rotation_preview_btn.click()
+        self.assertEqual(self.viewer._rotation_preview_angle, 0.0)
+        self.assertEqual(self.viewer.rotation_angle_spin.value(), 0.0)
+        self.assertEqual(self.viewer.single_view.sceneRect().width(), 400)
+        self.assertTrue(self.viewer.crop_btn.isEnabled())
+
+    def test_space_bar_pan_is_global_to_page_views(self):
+        target = self.viewer.rotation_angle_spin
+        QApplication.sendEvent(
+            target,
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Space,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+        self.assertTrue(all(view._pan for view in self._page_views()))
+        QApplication.sendEvent(
+            target,
+            QKeyEvent(
+                QEvent.Type.KeyRelease,
+                Qt.Key.Key_Space,
+                Qt.KeyboardModifier.NoModifier,
+            ),
+        )
+        self.assertTrue(all(not view._pan for view in self._page_views()))
+
+    def _page_views(self):
+        return (self.viewer.single_view, self.viewer.odd_view, self.viewer.even_view)
 
     def test_odd_even_crop_positions_survive_resize_and_view_changes(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
         self.viewer.images = [
             QImage(400, 600, QImage.Format.Format_RGB888),
             QImage(400, 600, QImage.Format.Format_RGB888),
@@ -266,19 +446,166 @@ class ViewerRegressionTests(unittest.TestCase):
             self.viewer.even_view.getSelectionRect().size(),
         )
 
-    def test_tool_and_menu_actions_have_icons(self):
+    def test_actions_use_custom_icons_and_auto_deskew_label(self):
         controls = (
             self.viewer.open_action,
             self.viewer.save_action,
             self.viewer.undo_action,
             self.viewer.crop_tool_btn,
-            self.viewer.whiteout_btn,
-            self.viewer.redact_btn,
+            self.viewer.cover_tool_btn,
             self.viewer.crop_btn,
+            self.viewer.pick_cover_color_btn,
+            self.viewer.preview_rotation_btn,
+            self.viewer.discard_rotation_preview_btn,
             self.viewer.delete_btn,
             self.viewer.save_btn,
         )
         self.assertTrue(all(not control.icon().isNull() for control in controls))
+        self.assertEqual(self.viewer.auto_deskew_btn.text(), "Auto deskew")
+        image = self.viewer.cover_tool_btn.icon().pixmap(QSize(18, 18)).toImage()
+        self.assertTrue(
+            any(
+                image.pixelColor(x, y).alpha() and image.pixelColor(x, y).red() > 230
+                for x in range(image.width())
+                for y in range(image.height())
+            )
+        )
+
+    def test_sidebar_never_shows_a_horizontal_scrollbar(self):
+        self.assertEqual(
+            self.viewer.scroll_area.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+
+    def test_rotation_scope_targets_stacks_and_previewed_pages(self):
+        document = fitz.open()
+        for _ in range(5):
+            document.new_page()
+        self.viewer.pdf_doc = document
+
+        self.viewer.rotation_scope_combo.setCurrentIndex(
+            self.viewer.rotation_scope_combo.findData("odd")
+        )
+        self.assertEqual(self.viewer._rotation_target_pages(), [0, 2, 4])
+        self.viewer.rotation_scope_combo.setCurrentIndex(
+            self.viewer.rotation_scope_combo.findData("even")
+        )
+        self.assertEqual(self.viewer._rotation_target_pages(), [1, 3])
+        self.viewer.preview_page_num = 3
+        self.viewer.crop_page_override_checkbox.setChecked(True)
+        self.assertEqual(self.viewer._rotation_target_pages(), [1, 3])
+        self.viewer.rotation_page_override_checkbox.setChecked(True)
+        self.assertEqual(self.viewer._rotation_target_pages(), [3])
+
+    def test_per_page_crop_override_can_differ_from_uniform_stack_size(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [
+            QImage(400, 600, QImage.Format.Format_RGB888),
+            QImage(400, 600, QImage.Format.Format_RGB888),
+        ]
+        self.viewer.updateOverlay()
+
+        self.viewer.odd_view.setSelection(QRectF(20, 30, 100, 200))
+        self.viewer.even_view.setSelection(QRectF(240, 50, 70, 150))
+        self.assertEqual(self.viewer.odd_view.getSelectionRect().size(), QSizeF(70, 150))
+        self.assertEqual(self.viewer.even_view.getSelectionRect().size(), QSizeF(70, 150))
+
+        self.viewer.togglePagePreview(0)
+        self.viewer.crop_page_override_checkbox.setChecked(True)
+        self.viewer.single_view.setSelection(QRectF(30, 40, 120, 180))
+
+        self.assertIn(0, self.viewer.page_crop_overrides)
+        self.assertEqual(self.viewer.odd_view.getSelectionRect().size(), QSizeF(70, 150))
+
+        with patch.object(self.viewer, "reloadImages"):
+            self.viewer.cropSelection()
+        page_override = fitz.Rect(self.viewer.active_crop_info["rects"][0])
+        stack_crop = fitz.Rect(self.viewer.active_crop_info["rects"][1])
+        self.assertNotAlmostEqual(page_override.width, stack_crop.width)
+        self.assertNotAlmostEqual(page_override.height, stack_crop.height)
+
+    def test_edit_toolbars_are_contextual_and_rotation_expands_independently(self):
+        document = fitz.open()
+        document.new_page()
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(100, 100, QImage.Format.Format_RGB888)]
+        self.viewer.updateActionState()
+
+        self.assertFalse(self.viewer.crop_toolbar.isHidden())
+        self.assertTrue(self.viewer.cover_toolbar.isHidden())
+        self.assertTrue(self.viewer.rotation_toolbar.isHidden())
+
+        self.viewer.cover_tool_btn.click()
+        self.assertTrue(self.viewer.crop_toolbar.isHidden())
+        self.assertFalse(self.viewer.cover_toolbar.isHidden())
+        self.viewer.pick_cover_color_btn.click()
+        self.assertTrue(all(view._tool == "pick_color" for view in self._page_views()))
+        self.viewer.onColorPicked(QColor(20, 40, 60))
+        self.assertTrue(all(view._tool == "cover" for view in self._page_views()))
+
+        self.viewer.rotation_options_toggle_btn.setChecked(True)
+        self.assertFalse(self.viewer.cover_toolbar.isHidden())
+        self.assertFalse(self.viewer.rotation_toolbar.isHidden())
+
+        self.viewer.crop_tool_btn.click()
+        self.assertFalse(self.viewer.crop_toolbar.isHidden())
+        self.assertTrue(self.viewer.cover_toolbar.isHidden())
+        self.assertFalse(self.viewer.rotation_toolbar.isHidden())
+
+    def test_toolbar_controls_use_one_height(self):
+        controls = (
+            self.viewer.crop_tool_btn,
+            self.viewer.cover_tool_btn,
+            self.viewer.rotation_options_toggle_btn,
+            self.viewer.view_stack_btn,
+            self.viewer.delete_btn,
+            self.viewer.undo_btn,
+            self.viewer.save_btn,
+            self.viewer.crop_btn,
+            self.viewer.reset_crop_btn,
+            self.viewer.crop_page_override_checkbox,
+            self.viewer.cover_color_btn,
+            self.viewer.pick_cover_color_btn,
+            self.viewer.cover_note_label,
+            self.viewer.rotation_page_override_checkbox,
+            self.viewer.rotation_scope_combo,
+            self.viewer.rotate_left_btn,
+            self.viewer.rotate_right_btn,
+            self.viewer.rotation_angle_spin,
+            self.viewer.preview_rotation_btn,
+            self.viewer.discard_rotation_preview_btn,
+            self.viewer.apply_rotation_btn,
+            self.viewer.auto_deskew_btn,
+        )
+        self.assertEqual({control.height() for control in controls}, {TOOLBAR_CONTROL_HEIGHT})
+
+    def test_primary_toolbar_keeps_save_visible_at_compact_width(self):
+        document = fitz.open()
+        document.new_page()
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(100, 100, QImage.Format.Format_RGB888)]
+        self.viewer.updateActionState()
+        self.viewer.rotation_options_toggle_btn.setChecked(True)
+        self.viewer.showNormal()
+        self.viewer.resize(1100, 800)
+        self.app.processEvents()
+
+        self.assertTrue(self.viewer.save_btn.isVisible())
+        for toolbar in (
+            self.viewer.main_toolbar,
+            self.viewer.crop_toolbar,
+            self.viewer.rotation_toolbar,
+        ):
+            extension = toolbar.findChild(QToolButton, "qt_toolbar_ext_button")
+            self.assertFalse(extension and extension.isVisible())
+
+        self.viewer.cover_tool_btn.click()
+        self.app.processEvents()
+        extension = self.viewer.cover_toolbar.findChild(QToolButton, "qt_toolbar_ext_button")
+        self.assertFalse(extension and extension.isVisible())
 
     def test_crop_selection_preserves_existing_cropbox_and_pending_crop_preview(self):
         document = fitz.open()

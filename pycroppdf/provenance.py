@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def sha256_file(path: str) -> str:
@@ -30,6 +30,7 @@ def build_manifest(
     page_map: list[int],
     original_page_count: int,
     crops: list[dict[str, Any]] | None = None,
+    rotations: list[dict[str, Any]] | None = None,
     whiteouts: list[dict[str, Any]] | None = None,
     redactions: list[dict[str, Any]] | None = None,
     source_sha256: str | None = None,
@@ -42,7 +43,7 @@ def build_manifest(
     return {
         "schema": "pycroppdf.provenance",
         "schema_version": SCHEMA_VERSION,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
         "source": {
             "path": os.path.abspath(source_path),
             "sha256": source_sha256 or sha256_file(source_path),
@@ -59,6 +60,7 @@ def build_manifest(
         ],
         "deleted_original_pages": deleted_pages,
         "crops": list(crops or []),
+        "rotations": list(rotations or []),
         "whiteouts": list(whiteouts or []),
         "redactions": list(redactions or []),
     }

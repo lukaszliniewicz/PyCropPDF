@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from PyQt6.QtCore import QRectF
 
@@ -68,3 +68,17 @@ def remap_crop_info_after_deletions(
         if page_num not in deleted_set
     ]
     return cloned
+
+
+def remap_page_mapping_after_deletions(
+    values: Mapping[int, object],
+    deleted_pages: Iterable[int],
+) -> dict[int, object]:
+    """Preserve page-keyed values while removing and renumbering pages."""
+    deleted = sorted({int(page_num) for page_num in deleted_pages})
+    deleted_set = set(deleted)
+    return {
+        int(page_num) - sum(deleted_page < int(page_num) for deleted_page in deleted): value
+        for page_num, value in values.items()
+        if int(page_num) not in deleted_set
+    }

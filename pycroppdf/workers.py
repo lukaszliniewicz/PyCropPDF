@@ -10,10 +10,11 @@ from collections.abc import Iterable
 from contextlib import suppress
 
 import fitz
-from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
+from PyQt6.QtCore import QObject, QRectF, QRunnable, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from .provenance import build_manifest, sha256_file, write_manifest
+from .rotation import deskew_pdf_bytes, recommended_deskew_workers, rotate_pdf_bytes
 
 MAX_RENDER_WORKERS = 4
 LOCAL_RENDER_PAGE_LIMIT = 2
@@ -109,6 +110,55 @@ def scene_rect_to_pdf_coords(
     )
     selected_pdf_rect.intersect(visible_rect)
     return _validate_rect(selected_pdf_rect, "The selection")
+
+
+def pdf_rect_to_scene_coords(
+    pdf_rect: fitz.Rect | Iterable[float],
+    page_image_dims: tuple[int, int],
+    canvas_dims: tuple[int, int],
+    page: fitz.Page,
+    visible_pdf_rect: fitz.Rect | Iterable[float] | None = None,
+) -> QRectF:
+    """Map an unrotated PDF rectangle into an overlay or page-preview scene.
+
+    This is the inverse of :func:`scene_rect_to_pdf_coords`.  Keeping both
+    directions in one place prevents a stack rectangle from being reused as
+    page-preview pixels when the stack canvas is larger than an individual
+    page.
+    """
+    image_width, image_height = page_image_dims
+    canvas_width, canvas_height = canvas_dims
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("The selected page has no renderable preview.")
+
+    visible_rect = fitz.Rect(visible_pdf_rect or page.cropbox)
+    visible_rect.intersect(page.cropbox)
+    _validate_rect(visible_rect, "The rendered page area")
+
+    selected_pdf_rect = fitz.Rect(pdf_rect)
+    selected_pdf_rect.intersect(visible_rect)
+    _validate_rect(selected_pdf_rect, "The selection")
+
+    visual_rect = _visible_pdf_rect_to_visual_rect(page, visible_rect)
+    crop_position = page.cropbox_position
+    local_selected_rect = fitz.Rect(
+        selected_pdf_rect.x0 - crop_position.x,
+        selected_pdf_rect.y0 - crop_position.y,
+        selected_pdf_rect.x1 - crop_position.x,
+        selected_pdf_rect.y1 - crop_position.y,
+    )
+    selected_visual_rect = fitz.Rect(local_selected_rect * page.rotation_matrix)
+
+    scale_x = image_width / visual_rect.width
+    scale_y = image_height / visual_rect.height
+    x_offset = (canvas_width - image_width) // 2
+    y_offset = (canvas_height - image_height) // 2
+    return QRectF(
+        x_offset + (selected_visual_rect.x0 - visual_rect.x0) * scale_x,
+        y_offset + (selected_visual_rect.y0 - visual_rect.y0) * scale_y,
+        selected_visual_rect.width * scale_x,
+        selected_visual_rect.height * scale_y,
+    )
 
 
 def _initialise_render_process(
@@ -211,6 +261,71 @@ class RenderAllPagesWorker(QRunnable):
             self.signals.finished.emit()
 
 
+class RotatePagesWorker(QRunnable):
+    """Apply manual page rotations outside the GUI thread."""
+
+    def __init__(self, pdf_bytes: bytes, rotations: dict[int, float]):
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.pdf_bytes = pdf_bytes
+        self.rotations = {int(page_num): float(angle) for page_num, angle in rotations.items()}
+
+    def run(self) -> None:
+        try:
+            rotated_pdf = rotate_pdf_bytes(self.pdf_bytes, self.rotations)
+            self.signals.result.emit(
+                {
+                    "pdf_bytes": rotated_pdf,
+                    "rotation_deltas": dict(self.rotations),
+                    "undetected_pages": [],
+                }
+            )
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+        finally:
+            self.signals.finished.emit()
+
+
+class AutoDeskewWorker(QRunnable):
+    """Detect and apply per-page skew corrections outside the GUI thread."""
+
+    def __init__(
+        self,
+        pdf_bytes: bytes,
+        page_numbers: Iterable[int],
+        max_workers: int | None = None,
+    ):
+        super().__init__()
+        self.signals = WorkerSignals()
+        self.pdf_bytes = pdf_bytes
+        self.page_numbers = tuple(sorted({int(page_num) for page_num in page_numbers}))
+        self.max_workers = (
+            recommended_deskew_workers(len(self.page_numbers))
+            if max_workers is None
+            else max(1, int(max_workers))
+        )
+
+    def run(self) -> None:
+        try:
+            deskewed_pdf, rotations, undetected = deskew_pdf_bytes(
+                self.pdf_bytes,
+                self.page_numbers,
+                max_workers=self.max_workers,
+            )
+            self.signals.result.emit(
+                {
+                    "pdf_bytes": deskewed_pdf,
+                    "rotation_deltas": rotations,
+                    "undetected_pages": undetected,
+                    "worker_count": self.max_workers,
+                }
+            )
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+        finally:
+            self.signals.finished.emit()
+
+
 def _resolve_operations(
     operations: Iterable[dict],
     page_map: list[int],
@@ -250,6 +365,7 @@ class SaveWorker(QRunnable):
         manifest_path: str | None = None,
         page_map: Iterable[int] | None = None,
         original_page_count: int | None = None,
+        rotations: Iterable[dict] | None = None,
         whiteouts: Iterable[dict] | None = None,
         redactions: Iterable[dict] | None = None,
         source_sha256: str | None = None,
@@ -264,6 +380,7 @@ class SaveWorker(QRunnable):
         self.manifest_path = manifest_path
         self.page_map = list(page_map or [])
         self.original_page_count = original_page_count
+        self.rotations = list(rotations or [])
         self.whiteouts = list(whiteouts or [])
         self.redactions = list(redactions or [])
         self.source_sha256 = source_sha256
@@ -323,6 +440,7 @@ class SaveWorker(QRunnable):
                     resolved_page_map,
                     int(self.original_page_count or len(resolved_page_map)),
                     crops=applied_crops,
+                    rotations=_resolve_operations(self.rotations, resolved_page_map),
                     whiteouts=_resolve_operations(self.whiteouts, resolved_page_map),
                     redactions=_resolve_operations(self.redactions, resolved_page_map),
                     source_sha256=source_sha256,

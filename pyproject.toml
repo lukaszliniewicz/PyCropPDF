@@ -4,28 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycroppdf"
-version = "0.3.1"
+version = "0.4.0"
 authors = [
   { name="Lukasz Liniewicz" },
 ]
-description = "A desktop utility for non-destructive PDF cropping, visual masking, and page-content redaction."
+description = "A desktop utility for cropping, rotating, and visually covering PDFs."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "PyMuPDF>=1.24,<2",
+    "PyMuPDF>=1.24.3,<2",
     "PyQt6>=6.5,<7",
 ]
 
 [project.optional-dependencies]
+deskew = [
+    "deskew>=1.6,<2",
+]
 dev = [
     "pytest>=8,<10",
     "ruff>=0.8,<1",
+]
+build = [
+    "pyinstaller>=6.11,<7",
 ]
 
 [project.urls]
@@ -34,11 +40,14 @@ dev = [
 [project.scripts]
 pycroppdf = "pycroppdf.run:main"
 
+[tool.setuptools]
+packages = ["pycroppdf"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]

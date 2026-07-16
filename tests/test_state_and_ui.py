@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import fitz
 from PyQt6.QtCore import QRectF, Qt
 from PyQt6.QtGui import QImage
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 from pycroppdf.main_window import PDFViewer
@@ -18,6 +19,7 @@ from pycroppdf.state import (
     remap_crop_info_after_deletions,
     remap_page_indices_after_deletions,
 )
+from pycroppdf.widgets import ThumbnailWidget
 from pycroppdf.workers import SaveWorker
 
 
@@ -134,6 +136,24 @@ class ViewerInteractionTests(unittest.TestCase):
         )
         self.assertEqual(self.viewer.selected_pages, {2, 3, 4, 5, 6})
 
+    def test_thumbnail_preview_click_does_not_select_and_checkbox_can_deselect(self):
+        thumbnail = ThumbnailWidget(2, QImage(80, 120, QImage.Format.Format_RGB888))
+        previews = []
+        selections = []
+        thumbnail.previewRequested.connect(previews.append)
+        thumbnail.selectionRequested.connect(
+            lambda page_num, modifiers, toggle: selections.append((page_num, modifiers, toggle))
+        )
+
+        QTest.mouseClick(thumbnail.label, Qt.MouseButton.LeftButton)
+        self.assertEqual(previews, [2])
+        self.assertEqual(selections, [])
+
+        thumbnail.checkbox.click()
+        self.assertEqual(selections[-1][0], 2)
+        self.assertTrue(selections[-1][2])
+        thumbnail.deleteLater()
+
     def test_processing_cursor_is_entered_and_left_once(self):
         with (
             patch.object(QApplication, "setOverrideCursor") as set_cursor,
@@ -146,7 +166,7 @@ class ViewerInteractionTests(unittest.TestCase):
         set_cursor.assert_called_once()
         restore_cursor.assert_called_once()
 
-    def test_whiteout_render_finishes_and_undo_restores_document(self):
+    def test_cover_render_finishes_and_undo_restores_document(self):
         with tempfile.TemporaryDirectory() as directory:
             source_path = os.path.join(directory, "source.pdf")
             document = fitz.open()
@@ -158,15 +178,15 @@ class ViewerInteractionTests(unittest.TestCase):
 
             self.viewer.loadPDF(source_path)
             self._wait_for_processing()
-            self.viewer.applyWhiteout(QRectF(10, 10, 40, 30), [0])
+            self.viewer.applyCover(QRectF(10, 10, 40, 30), [0])
             self._wait_for_processing()
 
-            self.assertEqual(len(self.viewer.whiteout_operations), 1)
+            self.assertEqual(len(self.viewer.cover_operations), 1)
             self.assertIsNone(QApplication.overrideCursor())
 
             self.viewer.undo()
             self._wait_for_processing()
-            self.assertEqual(self.viewer.whiteout_operations, [])
+            self.assertEqual(self.viewer.cover_operations, [])
             self.assertIsNone(QApplication.overrideCursor())
 
     def test_edit_operations_ignore_thumbnail_selection_and_follow_view_scope(self):
@@ -189,13 +209,9 @@ class ViewerInteractionTests(unittest.TestCase):
         self.viewer.selected_pages = {0, 2}
         self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
 
-        with patch.object(self.viewer, "applyWhiteout") as apply_whiteout:
-            self.viewer.handleWhiteoutRequest(QRectF(10, 10, 20, 20))
-        apply_whiteout.assert_called_once_with(QRectF(10, 10, 20, 20), [0, 1, 2])
-
-        with patch.object(self.viewer, "applyRedaction") as apply_redaction:
-            self.viewer.handleRedactionRequest(QRectF(20, 20, 30, 30))
-        apply_redaction.assert_called_once_with(QRectF(20, 20, 30, 30), [0, 1, 2])
+        with patch.object(self.viewer, "applyCover") as apply_cover:
+            self.viewer.handleCoverRequest(QRectF(10, 10, 20, 20))
+        apply_cover.assert_called_once_with(QRectF(10, 10, 20, 20), [0, 1, 2])
 
         self.viewer.preview_page_num = 1
         self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
@@ -204,7 +220,17 @@ class ViewerInteractionTests(unittest.TestCase):
             self.viewer.cropSelection()
         self.assertEqual(set(self.viewer.active_crop_info["rects"]), {0, 1, 2})
 
-    def test_undo_restores_document_crop_mapping_whiteouts_and_selection(self):
+        self.viewer.active_crop_info = None
+        self.viewer.showStackView()
+        self.viewer.single_view.setSelection(QRectF(10, 10, 200, 300))
+        self.viewer.togglePagePreview(1)
+        self.viewer.crop_page_override_checkbox.setChecked(True)
+        self.viewer.single_view.setSelection(QRectF(20, 20, 160, 240))
+        with patch.object(self.viewer, "reloadImages"):
+            self.viewer.cropSelection()
+        self.assertEqual(set(self.viewer.active_crop_info["rects"]), {0, 1, 2})
+
+    def test_undo_restores_document_crop_mapping_covers_and_selection(self):
         document = fitz.open()
         for _ in range(3):
             document.new_page(width=600, height=800)
@@ -215,7 +241,8 @@ class ViewerInteractionTests(unittest.TestCase):
             "rects": {2: QRectF(10, 10, 500, 700)},
             "image_dims": [(600, 800)] * 3,
         }
-        self.viewer.whiteout_operations = [{"original_page": 3, "rect": [1, 2, 3, 4]}]
+        self.viewer.cover_operations = [{"original_page": 3, "rect": [1, 2, 3, 4]}]
+        self.viewer.rotation_operations = [{"original_page": 1, "angle": 1.5}]
         self.viewer.selected_pages = {1, 2}
         self.viewer.selection_anchor = 1
         self.viewer.preview_page_num = 2
@@ -224,7 +251,8 @@ class ViewerInteractionTests(unittest.TestCase):
         self.viewer.pdf_doc.delete_page(1)
         self.viewer.page_map = [0, 2]
         self.viewer.active_crop_info = None
-        self.viewer.whiteout_operations = []
+        self.viewer.cover_operations = []
+        self.viewer.rotation_operations = []
         self.viewer.selected_pages = set()
         self.viewer.preview_page_num = None
 
@@ -234,7 +262,8 @@ class ViewerInteractionTests(unittest.TestCase):
         self.assertEqual(len(self.viewer.pdf_doc), 3)
         self.assertEqual(self.viewer.page_map, [0, 1, 2])
         self.assertEqual(self.viewer.active_crop_info["rects"][2], QRectF(10, 10, 500, 700))
-        self.assertEqual(self.viewer.whiteout_operations[0]["original_page"], 3)
+        self.assertEqual(self.viewer.cover_operations[0]["original_page"], 3)
+        self.assertEqual(self.viewer.rotation_operations, [{"original_page": 1, "angle": 1.5}])
         self.assertEqual(self.viewer.selected_pages, {1, 2})
         self.assertEqual(self.viewer.selection_anchor, 1)
         self.assertEqual(self.viewer.preview_page_num, 2)
