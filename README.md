@@ -37,10 +37,12 @@ Optional arguments:
 
 1. Open a PDF with **File > Open PDF...** or drag it into the window.
 2. Choose an overlay view for all pages, separate odd/even pages, or a single page from the thumbnail list.
-3. Select thumbnails to limit an operation to specific pages. Use `Ctrl`/`Cmd`-click to toggle pages and `Shift`-click to select a range.
+3. Select thumbnails only when deleting pages. Use `Ctrl`/`Cmd`-click to toggle pages and `Shift`-click to select a range.
 4. Draw visual masks or redactions first. To make further masks or redactions after cropping, click **Reset Crop**.
 5. Select **Crop Box**, draw a rectangle, then click **Apply Crop**. Odd/even crop rectangles share one size but keep independent positions.
 6. Use **Undo** or `Ctrl`+`Z` to revert an edit, then click **Save PDF**.
+
+Crop, mask, and redaction operations apply to every page. Odd/even crop rectangles keep separate positions and apply to their respective page groups.
 
 ## Tools
 

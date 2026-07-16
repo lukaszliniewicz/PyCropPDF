@@ -169,7 +169,7 @@ class ViewerInteractionTests(unittest.TestCase):
             self.assertEqual(self.viewer.whiteout_operations, [])
             self.assertIsNone(QApplication.overrideCursor())
 
-    def test_selected_pages_limit_crop_and_whiteout_targets(self):
+    def test_edit_operations_ignore_thumbnail_selection_and_follow_view_scope(self):
         document = fitz.open()
         for _ in range(3):
             document.new_page(width=300, height=400)
@@ -182,15 +182,27 @@ class ViewerInteractionTests(unittest.TestCase):
 
         with patch.object(self.viewer, "reloadImages"):
             self.viewer.cropSelection()
-        self.assertEqual(set(self.viewer.active_crop_info["rects"]), {1})
+        self.assertEqual(set(self.viewer.active_crop_info["rects"]), {0, 1, 2})
         self.assertIsNone(self.viewer.undo_stack[-1]["pdf_bytes"])
 
         self.viewer.active_crop_info = None
         self.viewer.selected_pages = {0, 2}
+        self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
+
         with patch.object(self.viewer, "applyWhiteout") as apply_whiteout:
             self.viewer.handleWhiteoutRequest(QRectF(10, 10, 20, 20))
-        apply_whiteout.assert_called_once()
-        self.assertEqual(apply_whiteout.call_args.args[1], [0, 2])
+        apply_whiteout.assert_called_once_with(QRectF(10, 10, 20, 20), [0, 1, 2])
+
+        with patch.object(self.viewer, "applyRedaction") as apply_redaction:
+            self.viewer.handleRedactionRequest(QRectF(20, 20, 30, 30))
+        apply_redaction.assert_called_once_with(QRectF(20, 20, 30, 30), [0, 1, 2])
+
+        self.viewer.preview_page_num = 1
+        self.assertEqual(self.viewer._target_pages_for_rectangle_request(), [0, 1, 2])
+        self.viewer.single_view.setSelection(QRectF(10, 10, 200, 300))
+        with patch.object(self.viewer, "reloadImages"):
+            self.viewer.cropSelection()
+        self.assertEqual(set(self.viewer.active_crop_info["rects"]), {0, 1, 2})
 
     def test_undo_restores_document_crop_mapping_whiteouts_and_selection(self):
         document = fitz.open()

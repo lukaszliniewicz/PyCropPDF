@@ -463,12 +463,12 @@ class PDFViewer(QMainWindow):
 
         if self.active_tool == "whiteout":
             self.statusBar().showMessage(
-                "Visual Mask selected. It only covers content; selected pages take priority.",
+                "Visual Mask selected. The rectangle will apply to every page.",
                 6000,
             )
         elif self.active_tool == "redact":
             self.statusBar().showMessage(
-                "Redact selected. Drag to permanently remove page content; selected pages take priority.",
+                "Redact selected. The rectangle will apply to every page.",
                 6000,
             )
         else:
@@ -628,9 +628,9 @@ class PDFViewer(QMainWindow):
 <li>Choose <b>Crop Box</b>, <b>Visual Mask</b>, or <b>Redact</b> in the toolbar, then drag on the page view.</li>
 <li>Click <b>Apply Crop</b> to preview a crop. You can restore it with <b>Reset Crop</b>.</li>
 <li>Click a thumbnail to select one page. Use <b>Ctrl</b> to toggle pages and <b>Shift</b> to select a range.</li>
-<li>Selected pages limit crop, masking, and redaction operations and can be removed with <b>Delete Selected Pages</b>.</li>
+<li>Crop, masking, and redaction apply to all pages. Odd/even crop boxes keep separate positions for their page groups. Thumbnail selection is only used by <b>Delete Selected Pages</b>.</li>
 <li>Use the <b>View</b> menu to switch between a single overlay of all pages or separate overlays for odd and even pages.</li>
-<li><b>Visual Mask</b> only covers content. Use <b>Redact</b> to remove selected page content; metadata and attachments are not removed.</li>
+<li><b>Visual Mask</b> only covers content. Use <b>Redact</b> to remove selected content; metadata and attachments are not removed.</li>
 <li>Use <b>Undo</b> to restore the previous crop, mask, redaction, or page deletion.</li>
 <li>Save your changes with the purple <b>Save PDF</b> button.</li>
 </ol>"""
@@ -1162,22 +1162,12 @@ class PDFViewer(QMainWindow):
             return
 
         scene_rects_by_page = {}
-        selected_targets = set(self.getSelectedPages())
-        if self.preview_page_num is not None:
+        if self.preview_page_num is not None or self.view_mode == "all":
             scene_rect = self.single_view.getSelectionRect()
             if not scene_rect:
                 QMessageBox.warning(self, "Warning", "Please draw a crop box first.")
                 return
-            target_pages = selected_targets or {self.preview_page_num}
-            for page_num in target_pages:
-                scene_rects_by_page[page_num] = scene_rect
-        elif self.view_mode == "all":
-            scene_rect = self.single_view.getSelectionRect()
-            if not scene_rect:
-                QMessageBox.warning(self, "Warning", "Please draw a crop box first.")
-                return
-            target_pages = selected_targets or set(range(len(self.pdf_doc)))
-            for page_num in target_pages:
+            for page_num in range(len(self.pdf_doc)):
                 scene_rects_by_page[page_num] = scene_rect
         else:
             odd_rect = self.odd_view.getSelectionRect()
@@ -1185,20 +1175,21 @@ class PDFViewer(QMainWindow):
             if not (odd_rect or even_rect):
                 QMessageBox.warning(self, "Warning", "Please draw at least one crop box.")
                 return
+            fallback_rect = odd_rect or even_rect
+            odd_rect = odd_rect or fallback_rect
+            even_rect = even_rect or fallback_rect
             if odd_rect:
                 for i in range(0, len(self.pdf_doc), 2):
-                    if not selected_targets or i in selected_targets:
-                        scene_rects_by_page[i] = odd_rect
+                    scene_rects_by_page[i] = odd_rect
             if even_rect:
                 for i in range(1, len(self.pdf_doc), 2):
-                    if not selected_targets or i in selected_targets:
-                        scene_rects_by_page[i] = even_rect
+                    scene_rects_by_page[i] = even_rect
 
         if not scene_rects_by_page:
             QMessageBox.warning(
                 self,
                 "Warning",
-                "The selected pages do not have a crop box for their odd/even group.",
+                "No pages in the current view have a crop box.",
             )
             return
 
@@ -1233,19 +1224,8 @@ class PDFViewer(QMainWindow):
         self.clearAllSelections()
         self.reloadImages(crop_rects)
 
-    def _target_pages_for_rectangle_request(self, sender):
-        target_pages = self.getSelectedPages()
-        if target_pages:
-            return target_pages
-        if self.preview_page_num is not None:
-            return [self.preview_page_num]
-        if sender == self.single_view:
-            return list(range(len(self.pdf_doc)))
-        if sender == self.odd_view:
-            return list(range(0, len(self.pdf_doc), 2))
-        if sender == self.even_view:
-            return list(range(1, len(self.pdf_doc), 2))
-        return []
+    def _target_pages_for_rectangle_request(self):
+        return list(range(len(self.pdf_doc)))
 
     def handleWhiteoutRequest(self, rect):
         self._handle_rectangle_request(rect, secure_redaction=False)
@@ -1266,7 +1246,7 @@ class PDFViewer(QMainWindow):
             )
             return
 
-        target_pages = self._target_pages_for_rectangle_request(self.sender())
+        target_pages = self._target_pages_for_rectangle_request()
         if not target_pages:
             return
 
