@@ -658,6 +658,43 @@ class ViewerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(sum(not toolbar.isHidden() for toolbar in toolbars), 1)
 
+    def test_crop_button_indicates_when_crop_remains_available_in_rotate_mode(self):
+        document = fitz.open()
+        document.new_page(width=400, height=600)
+        self.viewer.pdf_doc = document
+        self.viewer.images = [QImage(300, 450, QImage.Format.Format_RGB888)]
+        self.viewer.updateActionState()
+
+        self.assertFalse(self.viewer.crop_tool_btn.property("coActive"))
+        self.viewer.rotation_options_toggle_btn.click()
+
+        self.assertTrue(self.viewer.rotation_options_toggle_btn.isChecked())
+        self.assertFalse(self.viewer.crop_tool_btn.isChecked())
+        self.assertTrue(self.viewer.crop_tool_btn.property("coActive"))
+        self.assertIn("remains available", self.viewer.crop_tool_btn.toolTip())
+        self.assertEqual(
+            self.viewer.crop_tool_btn.accessibleDescription(),
+            self.viewer.crop_tool_btn.toolTip(),
+        )
+
+        self.viewer.rotation_angle_spin.setValue(3.0)
+        self.viewer.preview_rotation_btn.click()
+        self.assertFalse(self.viewer.crop_tool_btn.isEnabled())
+        self.assertFalse(self.viewer.crop_tool_btn.property("coActive"))
+        self.assertIn("Apply or discard", self.viewer.crop_tool_btn.toolTip())
+
+        self.viewer.discard_rotation_preview_btn.click()
+        self.assertTrue(self.viewer.crop_tool_btn.isEnabled())
+        self.assertTrue(self.viewer.crop_tool_btn.property("coActive"))
+
+        self.viewer.crop_tool_btn.click()
+        self.assertTrue(self.viewer.crop_tool_btn.isChecked())
+        self.assertFalse(self.viewer.crop_tool_btn.property("coActive"))
+
+        self.viewer.cover_tool_btn.click()
+        self.assertTrue(self.viewer.cover_tool_btn.isChecked())
+        self.assertFalse(self.viewer.crop_tool_btn.property("coActive"))
+
     def test_rotation_toolbar_and_preview_remain_available_with_an_active_crop(self):
         document = fitz.open()
         document.new_page(width=400, height=600)

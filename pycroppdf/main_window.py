@@ -194,6 +194,16 @@ class PDFViewer(QMainWindow):
                 background-color: #5d4f7f;
                 border-color: #9575cd;
             }
+            QPushButton#cropToolButton[coActive="true"] {
+                border: 2px solid #9575cd;
+                padding: 4px 6px;
+            }
+            QPushButton#cropToolButton[coActive="true"]:disabled {
+                background-color: #444444;
+                color: #888888;
+                border: 1px solid #555555;
+                padding: 5px 7px;
+            }
             QPushButton#saveButton {
                 background-color: #7e57c2;
                 color: white;
@@ -321,10 +331,13 @@ class PDFViewer(QMainWindow):
         self.tool_button_group.setExclusive(True)
 
         self.crop_tool_btn = QPushButton("Crop")
+        self.crop_tool_btn.setObjectName("cropToolButton")
+        self.crop_tool_btn.setProperty("coActive", False)
         self.crop_tool_btn.setIcon(vector_icon("crop"))
         self.crop_tool_btn.setCheckable(True)
         self.crop_tool_btn.setChecked(True)
         self.crop_tool_btn.setToolTip("Draw or adjust the crop box.")
+        self.crop_tool_btn.setAccessibleDescription("Draw or adjust the crop box.")
         self.crop_tool_btn.clicked.connect(lambda: self.setActiveTool("crop"))
         self.tool_button_group.addButton(self.crop_tool_btn)
         toolbar.addWidget(self.crop_tool_btn)
@@ -691,6 +704,38 @@ class PDFViewer(QMainWindow):
                 6000,
             )
         self.updateActionState()
+
+    def _updateCropToolIndicator(self, coordinate_tools_available):
+        co_active = self.active_tool == "rotate" and coordinate_tools_available
+        preview_blocked = (
+            self.active_tool == "rotate"
+            and self.pdf_doc is not None
+            and not self.is_processing
+            and abs(self._rotation_preview_angle) >= 0.01
+        )
+        state = "coactive" if co_active else "preview-blocked" if preview_blocked else "normal"
+        if getattr(self, "_crop_tool_indicator_state", None) == state:
+            return
+        self._crop_tool_indicator_state = state
+
+        self.crop_tool_btn.setProperty("coActive", co_active)
+        if co_active:
+            description = "Crop adjustment remains available while rotation controls are open."
+            icon_name = "crop-coactive"
+        elif preview_blocked:
+            description = "Apply or discard the rotation preview before adjusting the crop box."
+            icon_name = "crop"
+        else:
+            description = "Draw or adjust the crop box."
+            icon_name = "crop"
+        self.crop_tool_btn.setIcon(vector_icon(icon_name))
+        self.crop_tool_btn.setToolTip(description)
+        self.crop_tool_btn.setAccessibleDescription(description)
+
+        style = self.crop_tool_btn.style()
+        style.unpolish(self.crop_tool_btn)
+        style.polish(self.crop_tool_btn)
+        self.crop_tool_btn.update()
 
     def _updateCoverColorIcon(self):
         color = QColor.fromRgbF(*self.cover_color)
@@ -2448,6 +2493,7 @@ class PDFViewer(QMainWindow):
         available = has_document and not self.is_processing
         coordinate_tools_available = available and abs(self._rotation_preview_angle) < 0.01
         self.crop_tool_btn.setEnabled(coordinate_tools_available)
+        self._updateCropToolIndicator(coordinate_tools_available)
         cover_available = coordinate_tools_available
         self.cover_tool_btn.setEnabled(cover_available)
         self.cover_color_btn.setEnabled(cover_available)

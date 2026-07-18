@@ -20,6 +20,11 @@ _ICON_BODIES = {
     "stack": ('<rect x="6" y="4" width="13" height="15" rx="1"/><path d="M4 7v14h12"/>'),
     "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v6"/><path d="M12 7h.01"/>',
     "crop": '<path d="M7 3v14a2 2 0 0 0 2 2h12"/><path d="M3 7h14a2 2 0 0 1 2 2v12"/>',
+    "crop-coactive": (
+        '<path d="M7 3v14a2 2 0 0 0 2 2h12"/>'
+        '<path d="M3 7h14a2 2 0 0 1 2 2v12"/>'
+        '<path d="m16.5 4.5 1.5 1.5 3-3"/>'
+    ),
     "cover": '<rect x="3" y="6" width="18" height="12" rx="1"/>',
     "rotate": ('<path d="M20 7v5h-5"/><path d="M19 12a7 7 0 1 0-1.4 4.2"/>'),
     "delete": (
