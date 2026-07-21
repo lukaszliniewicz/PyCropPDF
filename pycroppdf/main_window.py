@@ -201,8 +201,8 @@ class PDFViewer(QMainWindow):
             QPushButton#cropToolButton[coActive="true"]:disabled {
                 background-color: #444444;
                 color: #888888;
-                border: 1px solid #555555;
-                padding: 5px 7px;
+                border: 2px solid #766892;
+                padding: 4px 6px;
             }
             QPushButton#saveButton {
                 background-color: #7e57c2;
@@ -706,29 +706,47 @@ class PDFViewer(QMainWindow):
         self.updateActionState()
 
     def _updateCropToolIndicator(self, coordinate_tools_available):
-        co_active = self.active_tool == "rotate" and coordinate_tools_available
+        co_active = self.active_tool == "rotate" and self.pdf_doc is not None
         preview_blocked = (
-            self.active_tool == "rotate"
-            and self.pdf_doc is not None
+            co_active
+            and not coordinate_tools_available
             and not self.is_processing
             and abs(self._rotation_preview_angle) >= 0.01
         )
-        state = "coactive" if co_active else "preview-blocked" if preview_blocked else "normal"
+        processing_blocked = co_active and not coordinate_tools_available and self.is_processing
+        if processing_blocked:
+            state = "processing-blocked"
+        elif preview_blocked:
+            state = "preview-blocked"
+        elif co_active:
+            state = "coactive"
+        else:
+            state = "normal"
         if getattr(self, "_crop_tool_indicator_state", None) == state:
             return
         self._crop_tool_indicator_state = state
 
         self.crop_tool_btn.setProperty("coActive", co_active)
-        if co_active:
-            description = "Crop adjustment remains available while rotation controls are open."
+        if processing_blocked:
+            description = (
+                "Crop remains active and will be available when the current operation finishes."
+            )
             icon_name = "crop-coactive"
         elif preview_blocked:
-            description = "Apply or discard the rotation preview before adjusting the crop box."
-            icon_name = "crop"
+            description = (
+                "Crop remains active but is temporarily locked. Apply or discard the rotation "
+                "preview to adjust it."
+            )
+            icon_name = "crop-coactive"
+        elif co_active:
+            description = "Crop adjustment remains available while rotation controls are open."
+            icon_name = "crop-coactive"
         else:
             description = "Draw or adjust the crop box."
             icon_name = "crop"
-        self.crop_tool_btn.setIcon(vector_icon(icon_name))
+        if getattr(self, "_crop_tool_icon_name", None) != icon_name:
+            self.crop_tool_btn.setIcon(vector_icon(icon_name))
+            self._crop_tool_icon_name = icon_name
         self.crop_tool_btn.setToolTip(description)
         self.crop_tool_btn.setAccessibleDescription(description)
 

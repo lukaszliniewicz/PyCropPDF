@@ -658,7 +658,7 @@ class ViewerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(sum(not toolbar.isHidden() for toolbar in toolbars), 1)
 
-    def test_crop_button_indicates_when_crop_remains_available_in_rotate_mode(self):
+    def test_crop_button_persists_through_rotation_preview_lock(self):
         document = fitz.open()
         document.new_page(width=400, height=600)
         self.viewer.pdf_doc = document
@@ -672,6 +672,7 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertFalse(self.viewer.crop_tool_btn.isChecked())
         self.assertTrue(self.viewer.crop_tool_btn.property("coActive"))
         self.assertIn("remains available", self.viewer.crop_tool_btn.toolTip())
+        coactive_icon_key = self.viewer.crop_tool_btn.icon().cacheKey()
         self.assertEqual(
             self.viewer.crop_tool_btn.accessibleDescription(),
             self.viewer.crop_tool_btn.toolTip(),
@@ -680,12 +681,15 @@ class ViewerRegressionTests(unittest.TestCase):
         self.viewer.rotation_angle_spin.setValue(3.0)
         self.viewer.preview_rotation_btn.click()
         self.assertFalse(self.viewer.crop_tool_btn.isEnabled())
-        self.assertFalse(self.viewer.crop_tool_btn.property("coActive"))
+        self.assertTrue(self.viewer.crop_tool_btn.property("coActive"))
+        self.assertEqual(self.viewer.crop_tool_btn.icon().cacheKey(), coactive_icon_key)
+        self.assertIn("remains active", self.viewer.crop_tool_btn.toolTip())
         self.assertIn("Apply or discard", self.viewer.crop_tool_btn.toolTip())
 
         self.viewer.discard_rotation_preview_btn.click()
         self.assertTrue(self.viewer.crop_tool_btn.isEnabled())
         self.assertTrue(self.viewer.crop_tool_btn.property("coActive"))
+        self.assertEqual(self.viewer.crop_tool_btn.icon().cacheKey(), coactive_icon_key)
 
         self.viewer.crop_tool_btn.click()
         self.assertTrue(self.viewer.crop_tool_btn.isChecked())
