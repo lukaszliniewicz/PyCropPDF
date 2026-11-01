@@ -23,9 +23,10 @@ first failure and never edits source or the type baseline.
 | Vulture | Scan application code, tests, entry-point wrappers, and the check scripts at 60% confidence, including unused functions and methods. Qt callbacks and documented compatibility aliases have explicit, type-checked references in `scripts/vulture_allowlist.py`. |
 | Import Linter | Reject cycles inside `pycroppdf` and imports against the declared layers. Adding a module requires placing it in the layer contract. |
 
-The application layers, from highest to lowest, are the CLI entry point, the window,
-workers/widgets/thumbnails/icons/state, preview adapters/rotation/provenance, and
-pure raster-cache/raster-geometry/processing helpers. Modules on the same layer are
+The application layers, from highest to lowest, are the CLI entry point, runtime
+diagnostics, the window, workers/widgets/thumbnails/icons/state, overlay groups/
+rotation/provenance, preview adapters, and pure raster-cache/raster-geometry/processing
+helpers. Modules on the same layer are
 independent. A lower layer must not import a higher layer. These contracts preserve
 the existing boundaries; future extractions should update them deliberately.
 
@@ -72,3 +73,30 @@ Use `uv sync --locked --extra build --extra deskew` for the locked build depende
 CI runs the static policy on Linux and tests on Linux/Windows with Python 3.11/3.13.
 GUI layout still needs visual review, including small windows and increased display
 scaling. Static checks and headless tests do not establish visual quality.
+
+## Standalone release builds
+
+The manually dispatched **Release builds** workflow builds the exact selected commit
+on Windows and Ubuntu 22.04 with the locked build/deskew dependencies. It verifies
+pinned AppImage tools, collects installed dependency notices, and saves build records
+with the source commit, lockfile hash, Python/package versions, and binary hash.
+Artifacts include the Windows executable, Linux AppImage, platform-specific notices,
+and build records. The workflow does not publish a release automatically.
+
+Both packaged executables must pass `--check-preview-runtime REPORT.json` and
+`--check-deskew-workers`. The first opens the actual window, renders a four-page
+fixture through spawned workers, opens a page preview, applies a partial edit, checks
+pixels/source preservation/cache cleanup, and saves a screenshot. Linux uses Xvfb
+with the xcb plugin; Windows uses its native platform plugin. These are automated
+runtime checks, not a claim of manual interaction or screen-reader qualification.
+
+For a local build, install `uv sync --locked --extra build --extra deskew`, then run
+`uv run --no-sync python scripts/build_release.py`. On Linux, supply verified
+`--appimagetool PATH --runtime PATH`; the pinned versions and SHA-256 values are in
+the workflow. Build output defaults to `dist/release`; existing outputs are preserved.
+
+Before publication, require green source CI and both packaged checks for the exact
+release commit. Download the workflow artifacts, verify their recorded hashes, inspect
+the screenshots, and attach the verified binaries/notices/build records plus a
+`SHA256SUMS` file to a draft release. Publish only after checking the tag target and
+uploaded asset hashes. Do not substitute a local rebuild for the checked artifacts.

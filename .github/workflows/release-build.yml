@@ -1,0 +1,106 @@
+name: Release builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  standalone:
+    name: Standalone (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+          - os: windows-latest
+            platform: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.29"
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install the locked build and deskew dependencies
+        run: uv sync --locked --extra build --extra deskew
+      - name: Install Linux runtime check dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0 xvfb xauth
+      - name: Fetch and verify the pinned AppImage tools
+        if: matrix.platform == 'linux'
+        run: |
+          uv run --no-sync python - <<'PY'
+          import hashlib
+          import urllib.request
+          from pathlib import Path
+          root = Path("build/appimage-tools")
+          root.mkdir(parents=True, exist_ok=True)
+          tools = [
+              ("appimagetool", "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage", "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"),
+              ("runtime", "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64", "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"),
+          ]
+          for name, url, expected in tools:
+              path = root / name
+              urllib.request.urlretrieve(url, path)
+              if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                  raise RuntimeError(f"AppImage tool checksum mismatch: {name}")
+              path.chmod(0o755)
+          PY
+      - name: Build Linux AppImage
+        if: matrix.platform == 'linux'
+        run: uv run --no-sync python scripts/build_release.py --appimagetool build/appimage-tools/appimagetool --runtime build/appimage-tools/runtime
+      - name: Build Windows executable
+        if: matrix.platform == 'windows'
+        run: uv run --no-sync python scripts/build_release.py
+      - name: Check the packaged preview and deskew workers
+        run: |
+          uv run --no-sync python - <<'PY'
+          import json
+          import os
+          import platform
+          import subprocess
+          from pathlib import Path
+          output = Path("tmp/runtime-check")
+          output.mkdir(parents=True, exist_ok=True)
+          windows = platform.system() == "Windows"
+          pattern = "*.exe" if windows else "*.AppImage"
+          binaries = list(Path("dist/release").glob(pattern))
+          if len(binaries) != 1:
+              raise RuntimeError(f"Expected one release executable, found {binaries}")
+          binary = binaries[0].resolve()
+          environment = dict(os.environ, QT_QPA_PLATFORM="windows" if windows else "xcb")
+          if not windows:
+              environment["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+          prefix = [] if windows else ["xvfb-run", "-a"]
+          report = (output / "preview.json").resolve()
+          for arguments in [["--check-preview-runtime", str(report)], ["--check-deskew-workers"]]:
+              subprocess.run([*prefix, str(binary), *arguments], env=environment, check=True, timeout=180)
+          result = json.loads(report.read_text(encoding="utf-8"))
+          if not result["passed"] or not result["source_unchanged"] or not result["cache_removed_on_close"]:
+              raise RuntimeError(f"Packaged preview check failed: {result}")
+          print(json.dumps(result, indent=2))
+          PY
+      - name: Upload binaries, notices, build records, and runtime-check evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.platform }}-x86_64
+          path: |
+            dist/release/*
+            tmp/runtime-check/*
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PyCropPDF
+Comment=Crop, rotate, and visually cover PDF pages
+Exec=PyCropPDF %f
+Icon=PyCropPDF
+Categories=Office;
+MimeType=application/pdf;
+Terminal=false

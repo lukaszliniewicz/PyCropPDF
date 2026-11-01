@@ -123,15 +123,23 @@ For reproducible development dependencies and the full static-check policy (Ruff
 Basedpyright, Vulture, and import-cycle/layer checks), see [CONTRIBUTING.md](CONTRIBUTING.md).
 The staged improvement work and its acceptance checks are in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
-Build a standalone Windows executable with PyInstaller:
+Build versioned standalone release files from the locked environment:
 
-```powershell
-python -m pip install -e ".[build,deskew]"
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
+```sh
+uv sync --locked --extra build --extra deskew
+uv run --no-sync python scripts/build_release.py
 ```
 
-Install `pycroppdf[deskew]` in the build environment to include **Auto deskew**. The build script supplies the PyInstaller hook needed by scikit-image's runtime package checks. Deskew roughly doubles the executable size.
+Windows builds produce an `.exe`; Linux builds additionally require the verified
+AppImage tools. See [the release-build instructions](CONTRIBUTING.md#standalone-release-builds)
+for tool pins, runtime checks, and publication steps. The manually dispatched
+**Release builds** workflow builds and checks both platforms. Auto deskew is included.
+The existing `scripts/build_windows.ps1` remains available for custom Windows builds.
 
 ## License
 
 [MIT](LICENSE)
+
+Standalone builds also include third-party components with their own license terms.
+Release downloads provide dependency notices and build records alongside the binaries;
+the project's MIT license does not replace those third-party terms.

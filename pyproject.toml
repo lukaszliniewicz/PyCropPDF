@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pycroppdf"
-version = "0.4.4"
+version = "0.5.0"
 authors = [
   { name="Lukasz Liniewicz" },
 ]
@@ -81,5 +81,5 @@ ancestors = ["pycroppdf"]
 name = "Keep document logic below the window and entry point"
 type = "layers"
 containers = ["pycroppdf"]
-layers = ["run", "main_window", "workers | widgets | thumbnails | icons | state", "overlay_groups | rotation | provenance", "preview_images", "raster_geometry | raster_cache | processing"]
+layers = ["run", "diagnostics", "main_window", "workers | widgets | thumbnails | icons | state", "overlay_groups | rotation | provenance", "preview_images", "raster_geometry | raster_cache | processing"]
 exhaustive = true

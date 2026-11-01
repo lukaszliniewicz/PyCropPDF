@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        -*) ;;
+        *)
+            INPUT_PDF=$1
+            shift
+            exec "$HERE/usr/bin/PyCropPDF/PyCropPDF" --input "$INPUT_PDF" "$@"
+            ;;
+    esac
+fi
+exec "$HERE/usr/bin/PyCropPDF/PyCropPDF" "$@"

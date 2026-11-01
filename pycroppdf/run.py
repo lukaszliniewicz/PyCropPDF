@@ -16,8 +16,15 @@ def main():
     )
     parser.add_argument("--check-deskew", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--check-deskew-workers", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--check-preview-runtime", type=str, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    if args.check_preview_runtime:
+        from .diagnostics import check_preview_runtime
+
+        check_preview_runtime(args.check_preview_runtime)
+        return
 
     if args.check_deskew:
         from .rotation import _deskew_dependencies
