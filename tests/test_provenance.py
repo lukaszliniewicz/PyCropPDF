@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-import fitz
+import pymupdf as fitz
 
 from pycroppdf.provenance import build_manifest, write_manifest
 from pycroppdf.workers import SaveWorker

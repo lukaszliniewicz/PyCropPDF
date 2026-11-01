@@ -1,14 +1,6 @@
-from PyQt6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QGraphicsScene,
-    QGraphicsView,
-    QLabel,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtWidgets import QGraphicsScene, QGraphicsView
 
 
 class PageGraphicsView(QGraphicsView):
@@ -283,82 +275,3 @@ class PageGraphicsView(QGraphicsView):
     def clearScene(self):
         self.scene.clear()
         self.selection_item = None
-
-
-class ThumbnailWidget(QWidget):
-    previewRequested = pyqtSignal(int)
-    selectionRequested = pyqtSignal(int, object, bool)
-
-    def __init__(self, page_num, image, parent=None):
-        super().__init__(parent)
-        self.setMaximumWidth(90)
-        layout = QVBoxLayout()
-        layout.setSpacing(2)
-        layout.setContentsMargins(2, 2, 2, 2)
-        self.checkbox = QCheckBox()
-        self.page_num = page_num
-        self._selected_for_deletion = False
-        self._selected_for_preview = False
-        self.checkbox.clicked.connect(self._request_selection)
-
-        self.label = QLabel()
-        self.setImage(image)
-        self.label.installEventFilter(self)
-
-        layout.addWidget(self.checkbox)
-        layout.addWidget(self.label)
-        layout.addWidget(QLabel(f"Page {page_num + 1}"))
-        self.setLayout(layout)
-
-    def setImage(self, image):
-        """Replace the thumbnail without rebuilding the sidebar widget."""
-        if image is not None and not image.isNull():
-            thumbnail = image.scaled(
-                QSize(80, 120),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.label.setPixmap(QPixmap.fromImage(thumbnail))
-        else:
-            # Placeholder for missing image
-            placeholder = QPixmap(80, 120)
-            placeholder.fill(Qt.GlobalColor.lightGray)
-            self.label.setPixmap(placeholder)
-
-    def eventFilter(self, source, event):
-        if source == self.label and event.type() == QEvent.Type.MouseButtonPress:
-            modifiers = event.modifiers()
-            range_modifiers = (
-                Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
-            )
-            if modifiers & range_modifiers:
-                self.selectionRequested.emit(self.page_num, modifiers, True)
-            else:
-                self.previewRequested.emit(self.page_num)
-            return True
-        return super().eventFilter(source, event)
-
-    def _request_selection(self):
-        self.selectionRequested.emit(self.page_num, QApplication.keyboardModifiers(), True)
-
-    def _refresh_highlight(self):
-        if self._selected_for_preview:
-            self.label.setStyleSheet("border: 3px solid #7e57c2;")
-        elif self._selected_for_deletion:
-            self.label.setStyleSheet("border: 2px dashed #9575cd;")
-        else:
-            self.label.setStyleSheet("border: 2px solid transparent;")
-
-        if self._selected_for_deletion:
-            self.setStyleSheet("background-color: #3a3446; border-radius: 4px;")
-        else:
-            self.setStyleSheet("background-color: transparent;")
-
-    def setSelectedForDeletion(self, selected):
-        self._selected_for_deletion = bool(selected)
-        self.checkbox.setChecked(self._selected_for_deletion)
-        self._refresh_highlight()
-
-    def setSelectedForPreview(self, selected):
-        self._selected_for_preview = bool(selected)
-        self._refresh_highlight()

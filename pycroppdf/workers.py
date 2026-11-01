@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing
 import os
 import tempfile
+import time
 import traceback
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import Generator, Iterable
+from contextlib import closing, suppress
 
-import fitz
+import pymupdf as fitz
 from PyQt6.QtCore import QObject, QRectF, QRunnable, pyqtSignal
 from PyQt6.QtGui import QImage
 
+from .overlay_groups import GroupedOverlay
+from .preview_images import (
+    OVERLAY_ASSET,
+    PreviewFrame,
+    PreviewLayout,
+    image_from_raster,
+    thumbnail_raster,
+)
+from .processing import CancellationToken, OperationCancelled, iter_bounded_results
 from .provenance import build_manifest, sha256_file, write_manifest
+from .raster_cache import RasterCache, RasterCacheError, RasterData
+from .raster_geometry import (
+    DEFAULT_MAX_RASTER_SIDE,
+    page_raster_geometry,
+    visible_pdf_rect_to_visual_rect,
+)
 from .rotation import (
     deskew_pdf_bytes,
     recommended_deskew_workers,
@@ -23,9 +40,11 @@ from .rotation import (
 
 MAX_RENDER_WORKERS = 4
 LOCAL_RENDER_PAGE_LIMIT = 2
+PREVIEW_FRAME_INTERVAL_SECONDS = 1.0
 _RENDER_PDF_BYTES: bytes | None = None
 _RENDER_CROP_RECTS: dict[int, tuple[float, float, float, float]] = {}
 _RENDER_DOCUMENT: fitz.Document | None = None
+_RENDER_MAX_DIMENSION: int | None = None
 
 
 class WorkerSignals(QObject):
@@ -34,17 +53,28 @@ class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     result = pyqtSignal(object)
+    progress = pyqtSignal(int, int)
+    cancelled = pyqtSignal()
+    prepared = pyqtSignal(object)
+    preview_ready = pyqtSignal(object)
 
 
-def rect_to_tuple(rect: fitz.Rect | Iterable[float]) -> tuple[float, float, float, float]:
+def rect_to_tuple(
+    rect: fitz.Rect | QRectF | Iterable[float],
+) -> tuple[float, float, float, float]:
     """Return a PDF rectangle as a picklable, immutable tuple."""
-    if all(hasattr(rect, attribute) for attribute in ("x", "y", "width", "height")):
+    if isinstance(rect, QRectF):
         normalized = fitz.Rect(
             rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height()
         )
     else:
         normalized = fitz.Rect(rect)
-    return tuple(float(value) for value in normalized)
+    return (
+        float(normalized.x0),
+        float(normalized.y0),
+        float(normalized.x1),
+        float(normalized.y1),
+    )
 
 
 def _validate_rect(rect: fitz.Rect, description: str) -> fitz.Rect:
@@ -54,15 +84,8 @@ def _validate_rect(rect: fitz.Rect, description: str) -> fitz.Rect:
 
 
 def _visible_pdf_rect_to_visual_rect(page: fitz.Page, pdf_rect: fitz.Rect) -> fitz.Rect:
-    """Convert an unrotated CropBox-relative PDF rectangle into displayed coordinates."""
-    crop_position = page.cropbox_position
-    local_rect = fitz.Rect(
-        pdf_rect.x0 - crop_position.x,
-        pdf_rect.y0 - crop_position.y,
-        pdf_rect.x1 - crop_position.x,
-        pdf_rect.y1 - crop_position.y,
-    )
-    return fitz.Rect(local_rect * page.rotation_matrix)
+    """Compatibility alias for the shared, non-Qt geometry helper."""
+    return visible_pdf_rect_to_visual_rect(page, pdf_rect)
 
 
 def scene_rect_to_pdf_coords(
@@ -169,28 +192,25 @@ def pdf_rect_to_scene_coords(
 def _initialise_render_process(
     pdf_bytes: bytes,
     crop_rects: dict[int, tuple[float, float, float, float]],
+    max_dimension: int | None = None,
 ) -> None:
     """Store the immutable render inputs once per process."""
-    global _RENDER_PDF_BYTES, _RENDER_CROP_RECTS, _RENDER_DOCUMENT
+    global _RENDER_PDF_BYTES, _RENDER_CROP_RECTS, _RENDER_DOCUMENT, _RENDER_MAX_DIMENSION
     _RENDER_PDF_BYTES = pdf_bytes
     _RENDER_CROP_RECTS = crop_rects
     _RENDER_DOCUMENT = fitz.open("pdf", pdf_bytes)
+    _RENDER_MAX_DIMENSION = max_dimension
 
 
 def _render_page_from_document(
     document: fitz.Document,
     page_num: int,
     crop_rects: dict[int, tuple[float, float, float, float]],
+    max_dimension: int | None = None,
 ):
     page = document[page_num]
-    clip_rect = None
-    crop_rect = crop_rects.get(page_num)
-    if crop_rect:
-        clip_rect = fitz.Rect(crop_rect)
-        clip_rect.intersect(page.cropbox)
-        _validate_rect(clip_rect, f"Crop rectangle for page {page_num + 1}")
-
-    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), clip=clip_rect)
+    geometry = page_raster_geometry(page, crop_rects.get(page_num), max_dimension=max_dimension)
+    pix = page.get_pixmap(matrix=fitz.Matrix(geometry.scale, geometry.scale), clip=geometry.clip)
     return page_num, pix.samples, pix.width, pix.height, pix.stride
 
 
@@ -198,7 +218,9 @@ def _render_page_task(page_num: int):
     """Render one page using the process-local PDF source."""
     if _RENDER_PDF_BYTES is None or _RENDER_DOCUMENT is None:
         raise RuntimeError("Render process was not initialized.")
-    return _render_page_from_document(_RENDER_DOCUMENT, page_num, _RENDER_CROP_RECTS)
+    return _render_page_from_document(
+        _RENDER_DOCUMENT, page_num, _RENDER_CROP_RECTS, _RENDER_MAX_DIMENSION
+    )
 
 
 def _image_from_render_result(result):
@@ -216,11 +238,20 @@ class RenderAllPagesWorker(QRunnable):
         num_pages: int,
         crop_info: dict | None = None,
         page_numbers: Iterable[int] | None = None,
+        *,
+        cancel_token: CancellationToken | None = None,
+        cache: RasterCache | None = None,
+        generation: int | None = None,
     ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
         self.num_pages = num_pages
+        self.cancel_token = cancel_token if cancel_token is not None else CancellationToken()
+        self.cache = cache
+        self.generation = generation
+        if cache is not None and generation is None:
+            raise ValueError("Cached previews require a document generation.")
         self.crop_info = crop_info or {}
         requested_pages = range(num_pages) if page_numbers is None else page_numbers
         self.page_numbers = tuple(sorted({int(page_num) for page_num in requested_pages}))
@@ -229,41 +260,180 @@ class RenderAllPagesWorker(QRunnable):
 
     def run(self) -> None:
         try:
+            self.cancel_token.raise_if_cancelled()
             crop_rects = {
                 int(page_num): rect_to_tuple(rect)
                 for page_num, rect in self.crop_info.get("rects", {}).items()
                 if rect
             }
-            if not self.page_numbers:
+            if self.cache is not None:
+                self._run_cached(crop_rects)
                 return
-
-            if len(self.page_numbers) <= LOCAL_RENDER_PAGE_LIMIT:
-                document = fitz.open("pdf", self.pdf_bytes)
-                try:
-                    for page_num in self.page_numbers:
-                        result = _render_page_from_document(document, page_num, crop_rects)
-                        self.signals.result.emit(_image_from_render_result(result))
-                finally:
-                    document.close()
-                return
-
-            process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
-            cpu_count = process_cpu_count() or 1
-            max_workers = min(len(self.page_numbers), MAX_RENDER_WORKERS, max(1, cpu_count - 1))
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=max_workers,
-                initializer=_initialise_render_process,
-                initargs=(self.pdf_bytes, crop_rects),
-            ) as executor:
-                futures = [
-                    executor.submit(_render_page_task, page_num) for page_num in self.page_numbers
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    self.signals.result.emit(_image_from_render_result(future.result()))
+            total = len(self.page_numbers)
+            self.signals.progress.emit(0, total)
+            with closing(self._render_results(self.page_numbers, crop_rects)) as results:
+                for completed, rendered in enumerate(results, start=1):
+                    self.cancel_token.raise_if_cancelled()
+                    result = _image_from_render_result(rendered)
+                    del rendered
+                    self.cancel_token.raise_if_cancelled()
+                    self.signals.result.emit(result)
+                    self.cancel_token.raise_if_cancelled()
+                    self.signals.progress.emit(completed, total)
+            self.cancel_token.raise_if_cancelled()
+        except OperationCancelled:
+            self.signals.cancelled.emit()
         except Exception:
             self.signals.error.emit(traceback.format_exc())
         finally:
             self.signals.finished.emit()
+
+    def _render_results(
+        self,
+        page_numbers: tuple[int, ...],
+        crop_rects: dict[int, tuple[float, float, float, float]],
+        max_dimension: int | None = None,
+    ) -> Generator[tuple[int, bytes, int, int, int], None, None]:
+        """Yield bounded raw buffers; cached mode never queues images to the GUI."""
+        if not page_numbers:
+            return
+        if len(page_numbers) <= LOCAL_RENDER_PAGE_LIMIT:
+            with fitz.open("pdf", self.pdf_bytes) as document:
+                for page_num in page_numbers:
+                    self.cancel_token.raise_if_cancelled()
+                    if max_dimension is None:
+                        yield _render_page_from_document(document, page_num, crop_rects)
+                    else:
+                        yield _render_page_from_document(
+                            document, page_num, crop_rects, max_dimension
+                        )
+            return
+
+        process_cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
+        max_workers = min(
+            len(page_numbers), MAX_RENDER_WORKERS, max(1, (process_cpu_count() or 1) - 1)
+        )
+        with (
+            concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialise_render_process,
+                initargs=(self.pdf_bytes, crop_rects, max_dimension),
+            ) as executor,
+            closing(
+                iter_bounded_results(
+                    executor,
+                    _render_page_task,
+                    page_numbers,
+                    max_pending=max_workers,
+                    cancel_token=self.cancel_token,
+                )
+            ) as results,
+        ):
+            yield from results
+
+    def _run_cached(self, crop_rects: dict[int, tuple[float, float, float, float]]) -> None:
+        cache, generation = self.cache, self.generation
+        assert cache is not None and generation is not None
+        dimensions = []
+        with fitz.open("pdf", self.pdf_bytes) as document:
+            if len(document) != self.num_pages:
+                raise ValueError("The preview page count does not match the document.")
+            for page_num in range(self.num_pages):
+                self.cancel_token.raise_if_cancelled()
+                dimensions.append(
+                    page_raster_geometry(
+                        document[page_num], crop_rects.get(page_num)
+                    ).logical_dimensions
+                )
+        self.cancel_token.raise_if_cancelled()
+        self.signals.prepared.emit(PreviewLayout(generation, tuple(dimensions)))
+        self.signals.progress.emit(0, self.num_pages)
+        if not dimensions:
+            return
+        requested = set(self.page_numbers)
+        overlay = GroupedOverlay(
+            cache, generation, dimensions, requested, self.cancel_token.raise_if_cancelled
+        )
+        completed = 0
+        last_frame = 0.0
+
+        def publish_frame(*, force: bool = False) -> None:
+            nonlocal last_frame
+            now = time.monotonic()
+            if not force and completed != 1 and now - last_frame < PREVIEW_FRAME_INTERVAL_SECONDS:
+                return
+            self.cancel_token.raise_if_cancelled()
+            bundle = overlay.encode()
+            self.cancel_token.raise_if_cancelled()
+            if not cache.write_asset(generation, OVERLAY_ASSET, bundle):
+                raise OperationCancelled()
+            self.cancel_token.raise_if_cancelled()
+            self.signals.preview_ready.emit(
+                PreviewFrame(generation, overlay.logical_dimensions, self.num_pages > 1)
+            )
+            # Encoding should not consume the interval intended for page work.
+            last_frame = time.monotonic()
+
+        # Reused groups need metadata notifications, without recovering their
+        # individual page buffers. Dirty groups still stream one page at a time.
+        for page_num in sorted(overlay.cached_pages):
+            self.cancel_token.raise_if_cancelled()
+            completed += 1
+            self.signals.result.emit((page_num, cache.info(page_num, generation=generation)))
+            self.signals.progress.emit(completed, self.num_pages)
+            publish_frame()
+
+        # Damaged temporary entries are regenerated just like missing pages.
+        for page_num in range(self.num_pages):
+            self.cancel_token.raise_if_cancelled()
+            if page_num in requested or page_num in overlay.cached_pages:
+                continue
+            try:
+                pixels = cache.read_page(page_num, generation=generation, cache=False)
+            except RasterCacheError:
+                pixels = None
+            if pixels is None:
+                requested.add(page_num)
+                continue
+            overlay.add(page_num, image_from_raster(pixels))
+            del pixels
+            completed += 1
+            self.signals.result.emit((page_num, cache.info(page_num, generation=generation)))
+            self.signals.progress.emit(completed, self.num_pages)
+            publish_frame()
+
+        with closing(
+            self._render_results(tuple(sorted(requested)), crop_rects, DEFAULT_MAX_RASTER_SIDE)
+        ) as results:
+            for rendered in results:
+                self.cancel_token.raise_if_cancelled()
+                page_num, samples, width, height, stride = rendered
+                pixels = RasterData(width, height, stride, samples)
+                image = image_from_raster(pixels)
+                info = cache.write_page(
+                    generation,
+                    page_num,
+                    logical_dimensions=dimensions[page_num],
+                    pixels=pixels,
+                    thumbnail=thumbnail_raster(image),
+                )
+                del rendered, samples, pixels
+                if info is None:
+                    raise OperationCancelled()
+                self.cancel_token.raise_if_cancelled()
+                overlay.add(page_num, image)
+                del image
+                completed += 1
+                self.signals.result.emit((page_num, info))
+                self.signals.progress.emit(completed, self.num_pages)
+                publish_frame()
+        self.cancel_token.raise_if_cancelled()
+        if cache.generation != generation:
+            raise OperationCancelled()
+        if len(cache.ready_pages) != self.num_pages:
+            raise RasterCacheError("Some preview pages are unavailable. Retry to regenerate them.")
+        publish_frame(force=True)
 
 
 class RotatePagesWorker(QRunnable):
@@ -314,10 +484,13 @@ class AutoDeskewWorker(QRunnable):
         page_numbers: Iterable[int],
         max_workers: int | None = None,
         crop_rects: dict[int, Iterable[float]] | None = None,
+        *,
+        cancel_token: CancellationToken | None = None,
     ):
         super().__init__()
         self.signals = WorkerSignals()
         self.pdf_bytes = pdf_bytes
+        self.cancel_token = cancel_token if cancel_token is not None else CancellationToken()
         self.page_numbers = tuple(sorted({int(page_num) for page_num in page_numbers}))
         self.crop_rects = {
             int(page_num): rect_to_tuple(rect) for page_num, rect in (crop_rects or {}).items()
@@ -330,16 +503,21 @@ class AutoDeskewWorker(QRunnable):
 
     def run(self) -> None:
         try:
+            self.cancel_token.raise_if_cancelled()
             deskewed_pdf, rotations, undetected = deskew_pdf_bytes(
                 self.pdf_bytes,
                 self.page_numbers,
                 max_workers=self.max_workers,
+                cancel_token=self.cancel_token,
+                on_progress=self.signals.progress.emit,
             )
+            self.cancel_token.raise_if_cancelled()
             transformed_crop_rects = transform_crop_rects_for_rotations(
                 self.pdf_bytes,
                 self.crop_rects,
                 rotations,
             )
+            self.cancel_token.raise_if_cancelled()
             self.signals.result.emit(
                 {
                     "pdf_bytes": deskewed_pdf,
@@ -349,6 +527,8 @@ class AutoDeskewWorker(QRunnable):
                     "worker_count": self.max_workers,
                 }
             )
+        except OperationCancelled:
+            self.signals.cancelled.emit()
         except Exception:
             self.signals.error.emit(traceback.format_exc())
         finally:
@@ -379,6 +559,40 @@ def _temporary_output_path(directory: str, suffix: str) -> str:
     os.close(file_descriptor)
     os.unlink(path)
     return path
+
+
+def _paths_alias(first_path: str, second_path: str) -> bool:
+    first_absolute = os.path.abspath(first_path)
+    second_absolute = os.path.abspath(second_path)
+    first_paths = {
+        os.path.normcase(first_absolute),
+        os.path.normcase(os.path.realpath(first_absolute)),
+    }
+    second_paths = {
+        os.path.normcase(second_absolute),
+        os.path.normcase(os.path.realpath(second_absolute)),
+    }
+    if first_paths.intersection(second_paths):
+        return True
+    try:
+        return os.path.samefile(first_absolute, second_absolute)
+    except OSError:
+        return False
+
+
+def _validate_manifest_path(
+    manifest_path: str | None,
+    save_path: str,
+    source_path: str | None,
+) -> None:
+    if manifest_path is None:
+        return
+    protected_paths = [(save_path, "output PDF")]
+    if source_path is not None:
+        protected_paths.append((source_path, "source PDF"))
+    for protected_path, description in protected_paths:
+        if _paths_alias(manifest_path, protected_path):
+            raise ValueError(f"Provenance manifest path must not alias the {description} path.")
 
 
 class SaveWorker(QRunnable):
@@ -424,6 +638,7 @@ class SaveWorker(QRunnable):
         manifest_temporary_path = None
         pdf_saved = False
         try:
+            _validate_manifest_path(self.manifest_path, self.save_path, self.source_path)
             output_directory = os.path.dirname(os.path.abspath(self.save_path))
             if not os.path.isdir(output_directory):
                 raise ValueError(f"Save directory does not exist: {output_directory}")
@@ -432,7 +647,8 @@ class SaveWorker(QRunnable):
             output_page_count = len(document)
             applied_crops = []
             crop_rects = self.crop_info.get("rects", {})
-            for page_num, page in enumerate(document):
+            for page_num in range(len(document)):
+                page = document[page_num]
                 crop_rect = crop_rects.get(page_num)
                 if not crop_rect:
                     continue
@@ -492,6 +708,7 @@ class SaveWorker(QRunnable):
             pdf_temporary_path = None
             pdf_saved = True
             if manifest_temporary_path:
+                assert self.manifest_path is not None
                 os.replace(manifest_temporary_path, self.manifest_path)
                 manifest_temporary_path = None
             self.signals.result.emit(

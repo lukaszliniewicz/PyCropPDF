@@ -4,3 +4,11 @@ build/
 dist/
 *.egg-info/
 tmp/
+.venv/
+.coverage
+coverage.json
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+graphify-out/

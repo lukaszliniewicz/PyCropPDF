@@ -34,7 +34,7 @@ def main():
         return
 
     if args.check_deskew_workers:
-        import fitz
+        import pymupdf as fitz
 
         from .rotation import deskew_available, deskew_pdf_bytes
 

@@ -63,6 +63,33 @@ Optional arguments:
 
 Crop applies to all pages. Cover uses its selected scope and remains additive. A per-page crop override replaces the stack crop only for that page.
 
+Rendering and Auto deskew show progress and a Cancel button; `Escape` also cancels.
+Work already in progress, including a page render or PDF write, finishes before
+cancellation completes. Cancelling Auto deskew leaves the document unchanged and
+preserves Undo history. Cancelling previews preserves committed edits;
+choose **Retry previews** before drawing another crop or cover. You can still save
+the document or undo committed edits. Closing during rendering or Auto deskew requests
+cancellation, then uses the normal unsaved-changes confirmation after cleanup.
+
+Stack overlays preserve the darkest ink from every page. White backgrounds do not
+hide marks from earlier pages, so isolated headers and footers remain visible in
+large stacks. Inspect individual pages when overlapping content becomes dense.
+Ready thumbnails can be opened while the remaining pages render. In the sidebar,
+use arrow keys to move, `Enter` to preview, and `Space` to check a page for deletion.
+Retries reuse completed previews; editing a page refreshes its preview without
+rendering unaffected pages again.
+
+Page images, thumbnails, and reusable overlay groups share a **500 MiB cache budget**
+allocated as needed. Least recently used page buffers spill to private compressed
+temporary files when the budget fills. Partial edits reuse unchanged overlay groups
+for ordinary page sizes, as well as unchanged page buffers. Group storage uses at
+most a quarter of the cache budget and stays in RAM. PDF documents, current display
+overlays, display buffers, and worker processes use additional memory.
+
+Very large pages use previews capped at 2,048 pixels on the longest side. Crop
+coordinates and exported PDF content retain their original precision; zoomed
+previews of unusually large pages may show less detail.
+
 Rotation, Auto deskew, and Cover remain available after cropping. Affected crop boxes follow the rotated pages; fine rotation expands their bounding boxes so cropped content is not cut at the corners. Apply or discard a rotation preview before drawing a cover. For pages with links, annotations, or form fields, the app warns before a fine-angle rotation because some appearances or destinations cannot be transformed exactly.
 
 ## Tools
@@ -91,6 +118,10 @@ pytest
 ruff check .
 ruff format --check .
 ```
+
+For reproducible development dependencies and the full static-check policy (Ruff,
+Basedpyright, Vulture, and import-cycle/layer checks), see [CONTRIBUTING.md](CONTRIBUTING.md).
+The staged improvement work and its acceptance checks are in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
 Build a standalone Windows executable with PyInstaller:
 

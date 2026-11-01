@@ -3,8 +3,8 @@ import os
 from contextlib import suppress
 from typing import Any
 
-import fitz
-from PyQt6.QtCore import QEvent, QRectF, QSignalBlocker, Qt, QThreadPool
+import pymupdf as fitz
+from PyQt6.QtCore import QEvent, QRectF, QSignalBlocker, Qt, QThreadPool, QTimer
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -24,21 +24,33 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
+    QStatusBar,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
 from .icons import icon_size, vector_icon
+from .preview_images import (
+    OVERLAY_ASSET,
+    CachedImages,
+    PreviewFrame,
+    PreviewLayout,
+    StreamingOverlay,
+    decode_overlay,
+    rotated_dimensions,
+)
+from .processing import CancellationToken
 from .provenance import sha256_bytes
+from .raster_cache import RasterCache, RasterCacheError, RasterInfo
+from .raster_geometry import DEFAULT_MAX_RASTER_SIDE
 from .rotation import (
     deskew_available,
     normalize_angle,
@@ -52,7 +64,8 @@ from .state import (
     remap_page_indices_after_deletions,
     remap_page_mapping_after_deletions,
 )
-from .widgets import PageGraphicsView, ThumbnailWidget
+from .thumbnails import ThumbnailView
+from .widgets import PageGraphicsView
 from .workers import (
     AutoDeskewWorker,
     RenderAllPagesWorker,
@@ -70,7 +83,10 @@ TOOLBAR_CONTROL_HEIGHT = 32
 class PDFViewer(QMainWindow):
     def __init__(self, input_pdf=None, save_directory=None, save_filename=None, manifest_path=None):
         super().__init__()
-        self.images = []
+        self.images: list[QImage | None] | CachedImages = []
+        self.preview_cache = RasterCache()
+        self._preview_frame: PreviewFrame | None = None
+        self._cache_error_pending = False
         self.setAcceptDrops(True)
         self.pdf_doc = None
         self.pdf_path = None
@@ -83,12 +99,16 @@ class PDFViewer(QMainWindow):
         self.threadpool = QThreadPool()
         self.is_processing = False
         self.pages_rendered = 0
-        self._render_target_pages = set()
         self._pending_render_pages = set()
-        self._render_was_full = True
         self.preview_page_num = None
         self.pending_status_message = ""
         self._operation_id = 0
+        self._processing_kind: str | None = None
+        self._operation_cancel_token: CancellationToken | None = None
+        self._cancelled_operation_id: int | None = None
+        self._failed_operation_id: int | None = None
+        self._previews_incomplete = False
+        self._close_after_processing = False
         self.is_dirty = False
         self.active_crop_info = None
         self.active_tool = "crop"
@@ -105,8 +125,11 @@ class PDFViewer(QMainWindow):
         self.selection_anchor = None
         self._selection_before_preview = None
         self._reload_after_processing = False
-        self._rotation_undo_pushed = False
+        self._reload_render_pages: set[int] | None = None
+        self._rotation_pending_snapshot: dict[str, Any] | None = None
         self._rotation_preview_angle = 0.0
+        self._status_bar = QStatusBar(self)
+        self.setStatusBar(self._status_bar)
 
         self.single_view_pixmap_cache = None
         self.odd_view_pixmap_cache = None
@@ -116,8 +139,6 @@ class PDFViewer(QMainWindow):
         self.single_view = PageGraphicsView()
         self.odd_view = PageGraphicsView()
         self.even_view = PageGraphicsView()
-
-        self.current_view = self.single_view
 
         self.single_view.selectionChanged.connect(self.sync_selection_from_single)
         self.odd_view.selectionChanged.connect(self.sync_selection_to_even)
@@ -247,9 +268,11 @@ class PDFViewer(QMainWindow):
 
         # Create Menus
         menu_bar = self.menuBar()
+        assert menu_bar is not None
 
         # File menu
         file_menu = menu_bar.addMenu("&File")
+        assert file_menu is not None
         self.open_action = QAction("&Open PDF...", self)
         self.open_action.setIcon(vector_icon("open"))
         self.open_action.triggered.connect(self.openPDF)
@@ -281,6 +304,7 @@ class PDFViewer(QMainWindow):
         file_menu.addAction(self.fast_save_action)
 
         edit_menu = menu_bar.addMenu("&Edit")
+        assert edit_menu is not None
         self.undo_action = QAction("&Undo", self)
         self.undo_action.setIcon(vector_icon("undo"))
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
@@ -289,6 +313,7 @@ class PDFViewer(QMainWindow):
 
         # View menu
         view_menu = menu_bar.addMenu("&View")
+        assert view_menu is not None
         self.view_mode_group = QActionGroup(self)
         self.view_mode_group.setExclusive(True)
 
@@ -308,8 +333,20 @@ class PDFViewer(QMainWindow):
         self.view_mode_group.addAction(self.all_pages_action)
         view_menu.addAction(self.all_pages_action)
 
+        self.retry_previews_action = QAction("&Retry Page Previews", self)
+        self.retry_previews_action.setShortcut(QKeySequence.StandardKey.Refresh)
+        self.retry_previews_action.triggered.connect(self.retryPreviews)
+        view_menu.addSeparator()
+        view_menu.addAction(self.retry_previews_action)
+
+        self.cancel_operation_action = QAction("Cancel Current Operation", self)
+        self.cancel_operation_action.setShortcut(QKeySequence("Escape"))
+        self.cancel_operation_action.triggered.connect(self.cancelOperation)
+        self.addAction(self.cancel_operation_action)
+
         # Help menu
         help_menu = menu_bar.addMenu("&Help")
+        assert help_menu is not None
         about_action = QAction("&About", self)
         about_action.setIcon(vector_icon("info"))
         about_action.triggered.connect(self.showHelp)
@@ -608,15 +645,9 @@ class PDFViewer(QMainWindow):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(4, 4, 4, 4)  # Add some padding
 
-        # Create thumbnail scroll area
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.thumbnail_widget = QWidget()
-        self.thumbnail_layout = QGridLayout(self.thumbnail_widget)
-        self.thumbnail_layout.setContentsMargins(0, 0, 0, 0)
-        self.thumbnail_layout.setSpacing(4)
-        self.scroll_area.setWidget(self.thumbnail_widget)
+        self.scroll_area = ThumbnailView()
+        self.scroll_area.previewRequested.connect(self.togglePagePreview)
+        self.scroll_area.selectionRequested.connect(self.handleThumbnailSelection)
         sidebar_layout.addWidget(self.scroll_area)
 
         content_layout.addWidget(sidebar)
@@ -631,7 +662,27 @@ class PDFViewer(QMainWindow):
 
         content_layout.addWidget(self.view_stack)
         main_layout.addWidget(content_widget)
-        self.statusBar().showMessage(
+        self.operation_progress = QProgressBar()
+        self.operation_progress.setMaximumWidth(140)
+        self.operation_progress.setFormat("%v/%m")
+        self.operation_progress.setAccessibleName("Operation progress")
+        self._status_bar.addPermanentWidget(self.operation_progress)
+
+        self.cancel_operation_btn = QPushButton("Cancel")
+        self.cancel_operation_btn.setFixedHeight(24)
+        self.cancel_operation_btn.setAccessibleName("Cancel current operation")
+        self.cancel_operation_btn.setToolTip(
+            "Cancel remaining work; work already in progress finishes first. Escape also cancels."
+        )
+        self.cancel_operation_btn.clicked.connect(self.cancelOperation)
+        self._status_bar.addPermanentWidget(self.cancel_operation_btn)
+
+        self.retry_previews_btn = QPushButton("Retry previews")
+        self.retry_previews_btn.setFixedHeight(24)
+        self.retry_previews_btn.setAccessibleName("Retry page previews")
+        self.retry_previews_btn.clicked.connect(self.retryPreviews)
+        self._status_bar.addPermanentWidget(self.retry_previews_btn)
+        self._status_bar.showMessage(
             "Crop Box tool selected. Draw a box, then click Apply Crop.",
             6000,
         )
@@ -697,9 +748,9 @@ class PDFViewer(QMainWindow):
             message = "Rotate selected. Choose the target pages and rotation."
             if self.active_crop_info:
                 message += " The active crop will follow the rotated pages."
-            self.statusBar().showMessage(message, 6000)
+            self._status_bar.showMessage(message, 6000)
         else:
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 "Crop Box tool selected. Draw a box, then click Apply Crop.",
                 6000,
             )
@@ -714,7 +765,10 @@ class PDFViewer(QMainWindow):
             and abs(self._rotation_preview_angle) >= 0.01
         )
         processing_blocked = co_active and not coordinate_tools_available and self.is_processing
-        if processing_blocked:
+        previews_blocked = self._previews_incomplete and not self.is_processing
+        if previews_blocked:
+            state = "previews-blocked-coactive" if co_active else "previews-blocked"
+        elif processing_blocked:
             state = "processing-blocked"
         elif preview_blocked:
             state = "preview-blocked"
@@ -727,7 +781,10 @@ class PDFViewer(QMainWindow):
         self._crop_tool_indicator_state = state
 
         self.crop_tool_btn.setProperty("coActive", co_active)
-        if processing_blocked:
+        if previews_blocked:
+            description = "Retry page previews before drawing or adjusting the crop box."
+            icon_name = "crop-coactive" if co_active else "crop"
+        elif processing_blocked:
             description = (
                 "Crop remains active and will be available when the current operation finishes."
             )
@@ -773,12 +830,12 @@ class PDFViewer(QMainWindow):
     def pickCoverColor(self):
         for view in [self.single_view, self.odd_view, self.even_view]:
             view.setTool("pick_color")
-        self.statusBar().showMessage("Click a page pixel to choose the cover color.", 6000)
+        self._status_bar.showMessage("Click a page pixel to choose the cover color.", 6000)
 
     def onColorPicked(self, color):
         self.cover_color = (color.redF(), color.greenF(), color.blueF())
         self._updateCoverColorIcon()
-        self.statusBar().showMessage(
+        self._status_bar.showMessage(
             f"Cover color set to RGB({color.red()}, {color.green()}, {color.blue()}).",
             6000,
         )
@@ -788,6 +845,13 @@ class PDFViewer(QMainWindow):
         if (
             event.type() in {QEvent.Type.KeyPress, QEvent.Type.KeyRelease}
             and event.key() == Qt.Key.Key_Space
+            and (
+                any(view.hasFocus() for view in (self.single_view, self.odd_view, self.even_view))
+                or (
+                    event.type() == QEvent.Type.KeyRelease
+                    and any(view._pan for view in (self.single_view, self.odd_view, self.even_view))
+                )
+            )
         ):
             if not event.isAutoRepeat():
                 active = event.type() == QEvent.Type.KeyPress
@@ -796,7 +860,7 @@ class PDFViewer(QMainWindow):
             return True
         return super().eventFilter(watched, event)
 
-    def pushUndo(self, include_pdf: bool = True) -> dict[str, Any] | None:
+    def pushUndo(self, include_pdf: bool = True, *, defer: bool = False) -> dict[str, Any] | None:
         if self.pdf_doc is None:
             return None
 
@@ -841,7 +905,8 @@ class PDFViewer(QMainWindow):
             "rotation_page_override": self._per_page_rotation_override_enabled(),
             "is_dirty": self.is_dirty,
         }
-        self.undo_store.append(snapshot)
+        if not defer:
+            self.undo_store.append(snapshot)
         self.updateActionState()
         return snapshot
 
@@ -895,6 +960,12 @@ class PDFViewer(QMainWindow):
         self.undo_store.release(self.undo_store.pop())
         self.updateActionState()
 
+    def _release_rotation_snapshot(self) -> None:
+        snapshot = self._rotation_pending_snapshot
+        self._rotation_pending_snapshot = None
+        if snapshot is not None:
+            self.undo_store.release(snapshot)
+
     def _rollbackUndoSnapshot(self, snapshot: dict[str, Any] | None) -> bool:
         if snapshot is None:
             return False
@@ -912,7 +983,7 @@ class PDFViewer(QMainWindow):
             return
 
         try:
-            self.statusBar().showMessage("Restoring previous document state...")
+            self._status_bar.showMessage("Restoring previous document state...")
             snapshot = self.undo_stack[-1]
             self._restoreUndoSnapshot(snapshot)
             self.undo_store.discard(snapshot)
@@ -968,13 +1039,13 @@ class PDFViewer(QMainWindow):
             return
         target_pages = self._cover_target_pages()
         if not target_pages:
-            self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
+            self._status_bar.showMessage("The selected Cover scope contains no pages.", 6000)
             return
         target = self._cover_target_description(target_pages)
         message = f"Cover target: {target}. Draw a rectangle; existing covers remain."
         if self.active_crop_info:
             message += " The active crop remains applied."
-        self.statusBar().showMessage(message, 6000)
+        self._status_bar.showMessage(message, 6000)
 
     def _per_page_rotation_override_enabled(self):
         return (
@@ -1000,11 +1071,11 @@ class PDFViewer(QMainWindow):
                                 self._page_canvas_dimensions(page_num),
                             )
                         )
-                self.statusBar().showMessage(f"Custom crop enabled for page {page_num + 1}.", 6000)
+                self._status_bar.showMessage(f"Custom crop enabled for page {page_num + 1}.", 6000)
             else:
                 self.page_crop_overrides.pop(page_num, None)
                 self._set_preview_crop_selection(page_num)
-                self.statusBar().showMessage(
+                self._status_bar.showMessage(
                     f"Page {page_num + 1} now follows its stack settings.", 6000
                 )
         self.updateActionState()
@@ -1186,10 +1257,12 @@ class PDFViewer(QMainWindow):
         QMessageBox.information(self, "About PyCropPDF", help_text)
 
     def togglePagePreview(self, page_num):
-        if self.is_processing:
+        if self.is_processing and self._processing_kind != "render":
             return
 
         page_num = int(page_num)
+        if not self._page_preview_ready(page_num):
+            return
         if self.preview_page_num == page_num:
             self.showStackView()
             return
@@ -1203,7 +1276,8 @@ class PDFViewer(QMainWindow):
         with QSignalBlocker(self.crop_page_override_checkbox):
             self.crop_page_override_checkbox.setChecked(page_num in self.page_crop_overrides)
         self.updateOverlay()
-        self._set_preview_crop_selection(page_num)
+        if not self.is_processing:
+            self._set_preview_crop_selection(page_num)
         self._sync_thumbnail_selection()
         self.rotationPreviewInputsChanged()
 
@@ -1225,33 +1299,34 @@ class PDFViewer(QMainWindow):
         self._sync_thumbnail_selection()
         self.rotationPreviewInputsChanged()
 
-    def _rotation_target_pages(self):
+    def _rotation_target_pages(self) -> list[int]:
         if self.pdf_doc is None:
             return []
-        if self._per_page_rotation_override_enabled():
+        if self._per_page_rotation_override_enabled() and self.preview_page_num is not None:
             return [self.preview_page_num]
         scope = self.rotation_scope_combo.currentData()
+        page_count = len(self.images) if self.is_processing else len(self.pdf_doc)
         if scope == "odd":
-            return list(range(0, len(self.pdf_doc), 2))
+            return list(range(0, page_count, 2))
         if scope == "even":
-            return list(range(1, len(self.pdf_doc), 2))
-        return list(range(len(self.pdf_doc)))
-
-    def updateRotationControls(self, *_args):
-        self.rotationPreviewInputsChanged()
+            return list(range(1, page_count, 2))
+        return list(range(page_count))
 
     def rotationPreviewInputsChanged(self, *_args):
+        if self.is_processing:
+            self.updateActionState()
+            return
         if abs(self._rotation_preview_angle) >= 0.01:
             self._rotation_preview_angle = 0.0
             if self.images and not self.is_processing:
                 self.updateOverlay()
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 "Rotation preview cleared because its angle or target changed. "
                 "Click Preview to refresh it.",
                 6000,
             )
         elif abs(self.rotation_angle_spin.value()) >= 0.01:
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 f"Angle set to {self.rotation_angle_spin.value():g}°. "
                 "Click Preview to inspect it or Apply to change the PDF.",
                 6000,
@@ -1264,13 +1339,13 @@ class PDFViewer(QMainWindow):
         angle = normalize_angle(self.rotation_angle_spin.value())
         targets = self._rotation_target_pages()
         if abs(angle) < 0.01 or not targets:
-            self.statusBar().showMessage("Enter a non-zero angle and choose a target.", 5000)
+            self._status_bar.showMessage("Enter a non-zero angle and choose a target.", 5000)
             return
 
         self._rotation_preview_angle = angle
         if self.images:
             self.updateOverlay()
-        self.statusBar().showMessage(
+        self._status_bar.showMessage(
             f"Previewing {angle:g}° on {len(targets)} page"
             f"{'s' if len(targets) != 1 else ''}. Apply or Discard when ready.",
             8000,
@@ -1286,7 +1361,7 @@ class PDFViewer(QMainWindow):
         if had_preview and self.images and not self.is_processing:
             self.updateOverlay()
         if had_preview or had_angle:
-            self.statusBar().showMessage("Rotation preview discarded.", 5000)
+            self._status_bar.showMessage("Rotation preview discarded.", 5000)
         self.updateActionState()
 
     def _confirm_arbitrary_rotation(self, target_pages):
@@ -1309,13 +1384,19 @@ class PDFViewer(QMainWindow):
         return response == QMessageBox.StandardButton.Ok
 
     def _start_rotation_worker(self, worker, status_message):
-        if self.pushUndo() is None:
+        snapshot = self.pushUndo(defer=True)
+        if snapshot is None:
             return
-        self._rotation_undo_pushed = True
+        # A failed/cancelled job must not evict an older Undo entry at either limit.
+        self._rotation_pending_snapshot = snapshot
+        token = getattr(worker, "cancel_token", None)
+        self._operation_cancel_token = token if isinstance(token, CancellationToken) else None
+        self._processing_kind = "deskew" if self._operation_cancel_token is not None else "rotate"
+        self.operation_progress.setRange(0, 0)
         self.setUIProcessing(True)
         self._operation_id += 1
         operation_id = self._operation_id
-        self.statusBar().showMessage(status_message)
+        self._status_bar.showMessage(status_message)
         worker.signals.result.connect(
             lambda result, operation_id=operation_id: self.rotationFinished(operation_id, result)
         )
@@ -1325,6 +1406,7 @@ class PDFViewer(QMainWindow):
         worker.signals.finished.connect(
             lambda operation_id=operation_id: self.processingFinished(operation_id)
         )
+        self._connect_worker_progress(worker, operation_id)
         self.threadpool.start(worker)
 
     def applyRotation(self, clockwise_degrees):
@@ -1333,7 +1415,7 @@ class PDFViewer(QMainWindow):
 
         clockwise_degrees = normalize_angle(clockwise_degrees)
         if abs(clockwise_degrees) < 0.01:
-            self.statusBar().showMessage("Enter a non-zero rotation angle.", 5000)
+            self._status_bar.showMessage("Enter a non-zero rotation angle.", 5000)
             return
         target_pages = self._rotation_target_pages()
         if not target_pages:
@@ -1352,7 +1434,7 @@ class PDFViewer(QMainWindow):
 
         rotations = dict.fromkeys(target_pages, clockwise_degrees)
         crop_rects = self.active_crop_info.get("rects", {}) if self.active_crop_info else {}
-        worker = RotatePagesWorker(self.pdf_doc.tobytes(), rotations, crop_rects)
+        worker = RotatePagesWorker(self.pdf_doc.tobytes(no_new_id=True), rotations, crop_rects)
         self._start_rotation_worker(
             worker,
             f"Rotating {len(target_pages)} page{'s' if len(target_pages) != 1 else ''}...",
@@ -1382,7 +1464,7 @@ class PDFViewer(QMainWindow):
 
         worker_count = recommended_deskew_workers(len(target_pages))
         worker = AutoDeskewWorker(
-            self.pdf_doc.tobytes(),
+            self.pdf_doc.tobytes(no_new_id=True),
             target_pages,
             max_workers=worker_count,
             crop_rects=(self.active_crop_info.get("rects", {}) if self.active_crop_info else {}),
@@ -1395,8 +1477,18 @@ class PDFViewer(QMainWindow):
         )
 
     def rotationFinished(self, operation_id, result):
-        if operation_id != self._operation_id:
+        if (
+            operation_id != self._operation_id
+            or not self.is_processing
+            or self._cancelled_operation_id == operation_id
+        ):
             return
+        if self._cancellation_requested():
+            self.processingCancelled(operation_id)
+            return
+        # This result is now being committed. A late Cancel must not undo it.
+        self._operation_cancel_token = None
+        self.updateActionState()
         rotations = {
             int(page_num): float(angle)
             for page_num, angle in result.get("rotation_deltas", {}).items()
@@ -1404,9 +1496,7 @@ class PDFViewer(QMainWindow):
         }
         undetected = list(result.get("undetected_pages", []))
         if not rotations:
-            if self._rotation_undo_pushed and self.undo_stack:
-                self._discardLastUndoSnapshot()
-            self._rotation_undo_pushed = False
+            self._release_rotation_snapshot()
             self.pending_status_message = "No usable skew angle was detected."
             self.updateActionState()
             return
@@ -1441,6 +1531,10 @@ class PDFViewer(QMainWindow):
                     }
                 )
 
+            if self._rotation_pending_snapshot is not None:
+                self.undo_store.append(self._rotation_pending_snapshot)
+                self._rotation_pending_snapshot = None
+
             old_document = self.pdf_doc
             self.pdf_doc = new_document
             new_document = None
@@ -1450,7 +1544,6 @@ class PDFViewer(QMainWindow):
                 old_document.close()
 
             self._refresh_dirty_state()
-            self._rotation_undo_pushed = False
             with QSignalBlocker(self.rotation_angle_spin):
                 self.rotation_angle_spin.setValue(0.0)
             self._rotation_preview_angle = 0.0
@@ -1460,6 +1553,7 @@ class PDFViewer(QMainWindow):
             self._selection_before_preview = None
             self.clearAllSelections()
             self._reload_after_processing = True
+            self._reload_render_pages = set(rotations)
             message = f"Rotated {len(rotations)} page{'s' if len(rotations) != 1 else ''}."
             if transformed_crop_rects:
                 message += " Active crop preserved."
@@ -1477,9 +1571,7 @@ class PDFViewer(QMainWindow):
     def rotationError(self, operation_id, error_str):
         if operation_id != self._operation_id:
             return
-        if self._rotation_undo_pushed and self.undo_stack:
-            self._discardLastUndoSnapshot()
-        self._rotation_undo_pushed = False
+        self._release_rotation_snapshot()
         self.processingError(operation_id, error_str)
 
     def clearAllSelections(self):
@@ -1519,7 +1611,7 @@ class PDFViewer(QMainWindow):
 
     def loadPDF(self, pdf_path, confirm_discard=True):
         if self.is_processing:
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 "Wait for the current operation to finish before opening another PDF.",
                 6000,
             )
@@ -1585,52 +1677,78 @@ class PDFViewer(QMainWindow):
         self.reloadImages()
         return True
 
+    def retryPreviews(self, *_args):
+        pages = None
+        if isinstance(self.images, CachedImages):
+            pages = set(range(len(self.images))) - self.images.ready_pages
+        self.reloadImages(pages)
+
     def reloadImages(self, page_numbers=None):
         if self.pdf_doc is None or self.is_processing:
             return
-
         num_pages = len(self.pdf_doc)
         if num_pages == 0:
-            self.updateThumbnails()
-            self.updateOverlay()
             return
-
         requested_pages = (
             set(range(num_pages))
             if page_numbers is None
             else {int(page_num) for page_num in page_numbers}
         )
-        if not requested_pages:
-            return
         if any(page_num < 0 or page_num >= num_pages for page_num in requested_pages):
             raise ValueError("A requested preview page is outside the document.")
+        try:
+            pdf_bytes = self.pdf_doc.tobytes(no_new_id=True)
+        except Exception as error:
+            self.renderingError(self._operation_id, str(error))
+            return
 
-        full_render = (
-            page_numbers is None
-            or len(self.images) != num_pages
-            or any(image is None for image in self.images)
+        preserve = None
+        dimensions = [(0, 0)] * num_pages
+        if isinstance(self.images, CachedImages) and len(self.images) == num_pages:
+            dimensions = list(self.images.dimensions)
+            if page_numbers is not None:
+                preserve = {page: page for page in range(num_pages) if page not in requested_pages}
+        generation = self.preview_cache.begin_generation(num_pages, preserve=preserve)
+        self.images = CachedImages(
+            self.preview_cache, generation, dimensions, self._queue_cache_error
         )
-        if full_render:
-            requested_pages = set(range(num_pages))
-            self.images = [None] * num_pages
-
-        self.setUIProcessing(True)
+        self._preview_frame = None
+        self._rotation_preview_angle = 0.0
+        self._previews_incomplete = True
+        self._processing_kind = "render"
+        self._operation_cancel_token = CancellationToken()
+        self.operation_progress.setRange(0, num_pages)
+        self.operation_progress.setValue(0)
         self.invalidate_pixmap_cache()
         self._operation_id += 1
         operation_id = self._operation_id
         self.pages_rendered = 0
-        self._render_target_pages = set(requested_pages)
-        self._pending_render_pages = set(requested_pages)
-        self._render_was_full = full_render
-        target_count = len(requested_pages)
-        self.statusBar().showMessage(f"Rendering page previews: 0/{target_count}...")
+        self._pending_render_pages = set(range(num_pages))
+        self.setUIProcessing(True)
+        self.updateThumbnails()
+        for view in (self.single_view, self.odd_view, self.even_view):
+            selection = self._selection_copy(view)
+            view.clearScene()
+            if selection is not None:
+                view.setSelection(selection, notify=False)
+        self._status_bar.showMessage(f"Rendering page previews: 0/{num_pages}...")
 
-        pdf_bytes = self.pdf_doc.tobytes()
         worker = RenderAllPagesWorker(
             pdf_bytes,
             num_pages,
             self.active_crop_info,
             page_numbers=requested_pages,
+            cancel_token=self._operation_cancel_token,
+            cache=self.preview_cache,
+            generation=generation,
+        )
+        worker.signals.prepared.connect(
+            lambda layout, operation_id=operation_id: self.previewLayoutPrepared(
+                operation_id, layout
+            )
+        )
+        worker.signals.preview_ready.connect(
+            lambda frame, operation_id=operation_id: self.previewReady(operation_id, frame)
         )
         worker.signals.result.connect(
             lambda result, operation_id=operation_id: self.pageRendered(operation_id, result)
@@ -1641,26 +1759,95 @@ class PDFViewer(QMainWindow):
         worker.signals.finished.connect(
             lambda operation_id=operation_id: self.processingFinished(operation_id)
         )
+        self._connect_worker_progress(worker, operation_id)
         self.threadpool.start(worker)
 
-    def pageRendered(self, operation_id, result):
-        if operation_id != self._operation_id or not self.is_processing:
-            return
-        page_num, image = result
-        if page_num >= len(self.images) or page_num not in self._pending_render_pages:
-            return
-        self.images[page_num] = image
-        self._pending_render_pages.remove(page_num)
-        self.pages_rendered += 1
-        self.statusBar().showMessage(
-            f"Rendering page previews: {self.pages_rendered}/{len(self._render_target_pages)}..."
+    def _accept_render_event(self, operation_id, generation):
+        return (
+            operation_id == self._operation_id
+            and self.is_processing
+            and self._processing_kind == "render"
+            and not self._cancellation_requested()
+            and generation == self.preview_cache.generation
         )
 
-        if self.pdf_doc is not None and not self._pending_render_pages:
-            thumbnail_pages = None if self._render_was_full else self._render_target_pages
-            self.updateThumbnails(thumbnail_pages)
+    def previewLayoutPrepared(self, operation_id, layout):
+        if not isinstance(layout, PreviewLayout) or not self._accept_render_event(
+            operation_id, layout.generation
+        ):
+            return
+        self.images = CachedImages(
+            self.preview_cache, layout.generation, layout.dimensions, self._queue_cache_error
+        )
+        self.updateThumbnails()
+
+    def pageRendered(self, operation_id, result):
+        page_num, info = result
+        if (
+            not isinstance(info, RasterInfo)
+            or not self._accept_render_event(operation_id, info.generation)
+            or page_num not in self._pending_render_pages
+        ):
+            return
+        self._pending_render_pages.remove(page_num)
+        self.pages_rendered += 1
+        self.updateThumbnails([page_num])
+        self._status_bar.showMessage(
+            f"Rendering page previews: {self.pages_rendered}/{len(self.images)}..."
+        )
+
+    def previewReady(self, operation_id, frame):
+        if not isinstance(frame, PreviewFrame) or not self._accept_render_event(
+            operation_id, frame.generation
+        ):
+            return
+        try:
+            data = self.preview_cache.read_asset(frame.generation, OVERLAY_ASSET)
+            if data is None:
+                return
+            all_pages, odd_pages, even_pages = decode_overlay(data)
+        except RasterCacheError as error:
+            self._queue_cache_error(frame.generation, -1, str(error))
+            return
+        self._preview_frame = frame
+        self.single_view_pixmap_cache = QPixmap.fromImage(all_pages)
+        self.odd_view_pixmap_cache = QPixmap.fromImage(odd_pages)
+        self.even_view_pixmap_cache = (
+            QPixmap.fromImage(even_pages) if frame.has_even_pages else None
+        )
+        if self.preview_page_num is None:
             self.updateOverlay()
-            self._restore_active_crop_selections()
+
+    def _queue_cache_error(self, generation, page_num, message):
+        if generation != self.preview_cache.generation or self.preview_cache.closed:
+            return
+        if self._cache_error_pending:
+            return
+        self._cache_error_pending = True
+        if self.is_processing:
+            self._failed_operation_id = self._operation_id
+
+        def report():
+            self._cache_error_pending = False
+            if generation != self.preview_cache.generation or self.preview_cache.closed:
+                return
+            LOGGER.warning("Temporary preview unavailable: %s", message)
+            self._previews_incomplete = True
+            if page_num >= 0:
+                self.updateThumbnails([page_num])
+            self.updateActionState()
+            self._status_bar.showMessage(
+                "A temporary preview is unavailable. Retry previews to restore it."
+            )
+
+        QTimer.singleShot(0, report)
+
+    def _page_preview_ready(self, page_num):
+        if not 0 <= page_num < len(self.images):
+            return False
+        if isinstance(self.images, CachedImages):
+            return self.images.has_page(page_num)
+        return self.images[page_num] is not None
 
     @staticmethod
     def _selection_copy(view):
@@ -1673,12 +1860,15 @@ class PDFViewer(QMainWindow):
         if not scene_rect.isEmpty():
             view.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
 
-    def _set_view_pixmap(self, view, pixmap, selection=None):
+    def _set_view_pixmap(self, view, pixmap, selection=None, logical_dimensions=None):
         view.clearScene()
         if pixmap is None or pixmap.isNull():
             return
-        view.scene.addPixmap(pixmap)
-        view.setSceneRect(QRectF(pixmap.rect()))
+        item = view.scene.addPixmap(pixmap)
+        width, height = logical_dimensions or (pixmap.width(), pixmap.height())
+        item.setTransform(QTransform.fromScale(width / pixmap.width(), height / pixmap.height()))
+        view.setSceneRect(QRectF(0, 0, width, height))
+        self.view_stack_layout.activate()
         self._fit_view(view)
         if selection:
             view.setSelection(selection, notify=False)
@@ -1691,9 +1881,44 @@ class PDFViewer(QMainWindow):
     def _preview_image(self, page_num, image):
         if page_num not in self._rotation_preview_targets():
             return image
-        return image.transformed(
+        image = image.transformed(
             QTransform().rotate(self._rotation_preview_angle),
             Qt.TransformationMode.SmoothTransformation,
+        )
+        if max(image.width(), image.height()) > DEFAULT_MAX_RASTER_SIDE:
+            image = image.scaled(
+                DEFAULT_MAX_RASTER_SIDE,
+                DEFAULT_MAX_RASTER_SIDE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        return image
+
+    def _cached_overlay_pixmaps(self):
+        assert isinstance(self.images, CachedImages)
+        targets = self._rotation_preview_targets()
+        if not targets:
+            dimensions = self._preview_frame.logical_dimensions if self._preview_frame else None
+            return (
+                self.single_view_pixmap_cache,
+                self.odd_view_pixmap_cache,
+                self.even_view_pixmap_cache,
+                dimensions,
+            )
+        dimensions = [
+            rotated_dimensions(size, self._rotation_preview_angle) if page in targets else size
+            for page, size in enumerate(self.images.dimensions)
+        ]
+        overlay = StreamingOverlay(dimensions)
+        for page_num in range(len(self.images)):
+            image = self.images[page_num]
+            if image is not None:
+                overlay.add(page_num, self._preview_image(page_num, image))
+        return (
+            QPixmap.fromImage(overlay.all_pages),
+            QPixmap.fromImage(overlay.odd_pages),
+            QPixmap.fromImage(overlay.even_pages) if len(self.images) > 1 else None,
+            overlay.logical_dimensions,
         )
 
     @staticmethod
@@ -1710,9 +1935,10 @@ class PDFViewer(QMainWindow):
         base = QImage(width, height, QImage.Format.Format_ARGB32)
         base.fill(Qt.GlobalColor.transparent)
         painter = QPainter(base)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-        for index, image in enumerate(images):
-            painter.setOpacity(1.0 if index == 0 else 0.2)
+        # White page backgrounds must not erase marks from earlier pages. Darken
+        # preserves the ink from every page and makes the result order independent.
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Darken)
+        for image in images:
             painter.drawImage((width - image.width()) // 2, (height - image.height()) // 2, image)
         painter.end()
         return QPixmap.fromImage(base)
@@ -1728,7 +1954,12 @@ class PDFViewer(QMainWindow):
                 return
             selection = self._selection_copy(self.single_view)
             pixmap = QPixmap.fromImage(self._preview_image(page_num, image))
-            self._set_view_pixmap(self.single_view, pixmap, selection)
+            dimensions = None
+            if isinstance(self.images, CachedImages):
+                dimensions = self.images.dimensions[page_num]
+                if page_num in self._rotation_preview_targets():
+                    dimensions = rotated_dimensions(dimensions, self._rotation_preview_angle)
+            self._set_view_pixmap(self.single_view, pixmap, selection, dimensions)
 
     def updateOverlay(self):
         if not self.images:
@@ -1759,7 +1990,7 @@ class PDFViewer(QMainWindow):
             return
 
         def scene_rect(page_num, canvas_dims):
-            if not (0 <= page_num < len(self.images)) or self.images[page_num] is None:
+            if not self._page_preview_ready(page_num):
                 return None
             crop_rect = crop_rects.get(page_num)
             if crop_rect is None:
@@ -1800,6 +2031,11 @@ class PDFViewer(QMainWindow):
 
         selection = self._selection_copy(self.single_view)
 
+        if isinstance(self.images, CachedImages):
+            all_pages, _odd, _even, dimensions = self._cached_overlay_pixmaps()
+            self._set_view_pixmap(self.single_view, all_pages, selection, dimensions)
+            return
+
         if self._rotation_preview_targets():
             preview_images = [
                 self._preview_image(page_num, image)
@@ -1814,36 +2050,7 @@ class PDFViewer(QMainWindow):
             return
 
         if self.single_view_pixmap_cache is None:
-            # Find maximum dimensions
-            valid_images = [img for img in self.images if img]
-            if not valid_images:
-                return
-            max_width = max(img.width() for img in valid_images)
-            max_height = max(img.height() for img in valid_images)
-
-            # Create a transparent base image of maximum size
-            base_img = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
-            base_img.fill(Qt.GlobalColor.transparent)
-
-            painter = QPainter(base_img)
-            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-            # Draw first page fully opaque
-            img = valid_images[0]
-            x = (max_width - img.width()) // 2
-            y = (max_height - img.height()) // 2
-            painter.setOpacity(1.0)
-            painter.drawImage(x, y, img)
-
-            # Draw remaining pages semi-transparent
-            for img in valid_images[1:]:
-                x = (max_width - img.width()) // 2
-                y = (max_height - img.height()) // 2
-                painter.setOpacity(0.2)
-                painter.drawImage(x, y, img)
-
-            painter.end()
-            self.single_view_pixmap_cache = QPixmap.fromImage(base_img)
+            self.single_view_pixmap_cache = self._compose_images(self.images)
 
         self._set_view_pixmap(self.single_view, self.single_view_pixmap_cache, selection)
 
@@ -1853,6 +2060,12 @@ class PDFViewer(QMainWindow):
 
         odd_selection = self._selection_copy(self.odd_view)
         even_selection = self._selection_copy(self.even_view)
+
+        if isinstance(self.images, CachedImages):
+            _all, odd_pages, even_pages, dimensions = self._cached_overlay_pixmaps()
+            self._set_view_pixmap(self.odd_view, odd_pages, odd_selection, dimensions)
+            self._set_view_pixmap(self.even_view, even_pages, even_selection, dimensions)
+            return
 
         if self._rotation_preview_targets():
             preview_images = {
@@ -1896,28 +2109,9 @@ class PDFViewer(QMainWindow):
         odd_pages = [img for img in self.images[::2] if img]
         if odd_pages:
             if self.odd_view_pixmap_cache is None:
-                base_odd = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
-                base_odd.fill(Qt.GlobalColor.transparent)
-
-                painter = QPainter(base_odd)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-                # Draw first odd page fully opaque
-                img = odd_pages[0]
-                x = (max_width - img.width()) // 2
-                y = (max_height - img.height()) // 2
-                painter.setOpacity(1.0)
-                painter.drawImage(x, y, img)
-
-                # Draw remaining odd pages semi-transparent
-                for img in odd_pages[1:]:
-                    x = (max_width - img.width()) // 2
-                    y = (max_height - img.height()) // 2
-                    painter.setOpacity(0.2)
-                    painter.drawImage(x, y, img)
-
-                painter.end()
-                self.odd_view_pixmap_cache = QPixmap.fromImage(base_odd)
+                self.odd_view_pixmap_cache = self._compose_images(
+                    odd_pages, (max_width, max_height)
+                )
 
             self._set_view_pixmap(self.odd_view, self.odd_view_pixmap_cache, odd_selection)
         else:
@@ -1927,94 +2121,37 @@ class PDFViewer(QMainWindow):
         even_pages = [img for img in self.images[1::2] if img]
         if even_pages:
             if self.even_view_pixmap_cache is None:
-                base_even = QImage(max_width, max_height, QImage.Format.Format_ARGB32)
-                base_even.fill(Qt.GlobalColor.transparent)
-
-                painter = QPainter(base_even)
-                painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
-                # Draw first even page fully opaque
-                img = even_pages[0]
-                x = (max_width - img.width()) // 2
-                y = (max_height - img.height()) // 2
-                painter.setOpacity(1.0)
-                painter.drawImage(x, y, img)
-
-                # Draw remaining even pages semi-transparent
-                for img in even_pages[1:]:
-                    x = (max_width - img.width()) // 2
-                    y = (max_height - img.height()) // 2
-                    painter.setOpacity(0.2)
-                    painter.drawImage(x, y, img)
-
-                painter.end()
-                self.even_view_pixmap_cache = QPixmap.fromImage(base_even)
+                self.even_view_pixmap_cache = self._compose_images(
+                    even_pages, (max_width, max_height)
+                )
 
             self._set_view_pixmap(self.even_view, self.even_view_pixmap_cache, even_selection)
         else:
             self.even_view.clearScene()
 
+    def _thumbnail_image(self, page_num):
+        if isinstance(self.images, CachedImages):
+            return self.images.thumbnail(page_num)
+        return self.images[page_num]
+
     def updateThumbnails(self, page_numbers=None):
-        if page_numbers is not None:
-            thumbnails = {widget.page_num: widget for widget in self._thumbnail_widgets()}
-            if len(thumbnails) == len(self.images):
-                for page_num in sorted({int(page_num) for page_num in page_numbers}):
-                    thumbnail = thumbnails.get(page_num)
-                    if thumbnail is not None:
-                        thumbnail.setImage(self.images[page_num])
-                        thumbnail.setSelectedForDeletion(page_num in self.selected_pages)
-                        thumbnail.setSelectedForPreview(page_num == self.preview_page_num)
-                return
-
-        # Reset any existing row stretches to prevent alignment issues with varying page counts
-        for i in range(self.thumbnail_layout.rowCount()):
-            self.thumbnail_layout.setRowStretch(i, 0)
-
-        # Clear existing thumbnails
-        while self.thumbnail_layout.count():
-            item = self.thumbnail_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # Create grid layout if not already using one
-        if not isinstance(self.thumbnail_layout, QGridLayout):
-            old_widget = self.thumbnail_widget
-            self.thumbnail_widget = QWidget()
-            self.thumbnail_layout = QGridLayout(self.thumbnail_widget)
-            self.thumbnail_layout.setContentsMargins(0, 0, 0, 0)
-            self.thumbnail_layout.setSpacing(4)
-            self.scroll_area.setWidget(self.thumbnail_widget)
-            old_widget.deleteLater()
-
-        # Add thumbnails in a 2-column grid
-        for i, image in enumerate(self.images):
-            row = i // 2
-            col = i % 2
-            thumbnail = ThumbnailWidget(i, image)
-            thumbnail.previewRequested.connect(self.togglePagePreview)
-            thumbnail.selectionRequested.connect(self.handleThumbnailSelection)
-            thumbnail.setSelectedForDeletion(i in self.selected_pages)
-            thumbnail.setSelectedForPreview(i == self.preview_page_num)
-            self.thumbnail_layout.addWidget(thumbnail, row, col)
-
-        # Add a stretch to the bottom to align thumbnails to the top
-        if self.images:
-            num_rows = (len(self.images) + 1) // 2
-            self.thumbnail_layout.setRowStretch(num_rows, 1)
+        if page_numbers is None or self.scroll_area.pages.rowCount() != len(self.images):
+            self.scroll_area.pages.set_source(
+                len(self.images), self._thumbnail_image, self._page_preview_ready
+            )
+        else:
+            self.scroll_area.pages.update_pages(page_numbers)
+        self._sync_thumbnail_selection()
 
     def getSelectedPages(self):
         return sorted(self.selected_pages)
 
-    def _thumbnail_widgets(self):
-        for i in range(self.thumbnail_layout.count()):
-            widget = self.thumbnail_layout.itemAt(i).widget()
-            if isinstance(widget, ThumbnailWidget):
-                yield widget
-
     def _sync_thumbnail_selection(self):
-        for widget in self._thumbnail_widgets():
-            widget.setSelectedForDeletion(widget.page_num in self.selected_pages)
-            widget.setSelectedForPreview(widget.page_num == self.preview_page_num)
+        self.scroll_area.pages.set_state(
+            self.selected_pages,
+            self.preview_page_num,
+            self.pdf_doc is not None and not self.is_processing and not self._previews_incomplete,
+        )
 
     def handleThumbnailSelection(self, page_num, modifiers, toggle=False):
         if self.is_processing:
@@ -2022,7 +2159,9 @@ class PDFViewer(QMainWindow):
 
         page_num = int(page_num)
         modifiers = modifiers or Qt.KeyboardModifier.NoModifier
-        control = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        control = bool(
+            modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier)
+        )
         shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
 
         if shift and self.selection_anchor is not None:
@@ -2045,7 +2184,7 @@ class PDFViewer(QMainWindow):
         self._sync_thumbnail_selection()
         self.updateActionState()
         count = len(self.selected_pages)
-        self.statusBar().showMessage(
+        self._status_bar.showMessage(
             f"{count} page{'s' if count != 1 else ''} selected. "
             "Use the checkboxes or Ctrl to toggle pages; Shift selects a range.",
             6000,
@@ -2087,7 +2226,7 @@ class PDFViewer(QMainWindow):
     def dropEvent(self, event):
         if self.is_processing:
             event.ignore()
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 "Wait for the current operation to finish before opening another PDF.",
                 6000,
             )
@@ -2109,6 +2248,8 @@ class PDFViewer(QMainWindow):
             event.ignore()
 
     def _current_image_dimensions(self):
+        if isinstance(self.images, CachedImages):
+            return list(self.images.dimensions)
         return [(image.width(), image.height()) if image else (0, 0) for image in self.images]
 
     def _page_canvas_dimensions(self, page_num):
@@ -2268,10 +2409,10 @@ class PDFViewer(QMainWindow):
 
         target_pages = self._target_pages_for_rectangle_request()
         if not target_pages:
-            self.statusBar().showMessage("The selected Cover scope contains no pages.", 6000)
+            self._status_bar.showMessage("The selected Cover scope contains no pages.", 6000)
             return
         target = self._cover_target_description(target_pages)
-        self.statusBar().showMessage(f"Adding cover to {target}; existing covers remain.")
+        self._status_bar.showMessage(f"Adding cover to {target}; existing covers remain.")
         self.applyCover(rect, target_pages)
 
     def handleWhiteoutRequest(self, rect):
@@ -2303,7 +2444,7 @@ class PDFViewer(QMainWindow):
             return
         try:
             target = self._cover_target_description(target_pages)
-            self.statusBar().showMessage(f"Adding cover to {target}; existing covers remain.")
+            self._status_bar.showMessage(f"Adding cover to {target}; existing covers remain.")
 
             for page_num in target_pages:
                 page = self.pdf_doc[page_num]
@@ -2316,12 +2457,30 @@ class PDFViewer(QMainWindow):
                     "original_page": original_page + 1,
                     "rect": [round(float(value), 3) for value in pdf_rect],
                 }
-                page.draw_rect(
-                    pdf_rect,
-                    color=self.cover_color,
-                    fill=self.cover_color,
-                    width=0,
+                # Our crop rectangles include the CropBox offset; drawing APIs
+                # use unrotated coordinates relative to the existing CropBox.
+                position = page.cropbox_position
+                drawing_rect = fitz.Rect(
+                    pdf_rect.x0 - position.x,
+                    pdf_rect.y0 - position.y,
+                    pdf_rect.x1 - position.x,
+                    pdf_rect.y1 - position.y,
                 )
+                # PyMuPDF's drawing transform differs for rotated, offset
+                # CropBoxes. Draw with rotation cleared, then restore metadata.
+                rotation = page.rotation
+                try:
+                    if rotation:
+                        page.set_rotation(0)
+                    page.draw_rect(
+                        drawing_rect,
+                        color=self.cover_color,
+                        fill=self.cover_color,
+                        width=0,
+                    )
+                finally:
+                    if rotation:
+                        page.set_rotation(rotation)
                 operation["color"] = [round(float(value), 4) for value in self.cover_color]
                 self.cover_operations.append(operation)
 
@@ -2389,8 +2548,12 @@ class PDFViewer(QMainWindow):
 
             for page_num in selected_pages:
                 self.pdf_doc.delete_page(page_num)
-                self.images.pop(page_num)
+                if isinstance(self.images, list):
+                    self.images.pop(page_num)
                 self.page_map.pop(page_num)
+            if isinstance(self.images, CachedImages):
+                self.images = self.images.without_pages(deleted_set)
+                self._preview_frame = None
 
             new_canvas = self._stack_canvas_dimensions()
             offset_x = (new_canvas[0] - old_canvas[0]) / 2
@@ -2425,10 +2588,14 @@ class PDFViewer(QMainWindow):
             if self.preview_page_num is not None:
                 self._set_preview_crop_selection(self.preview_page_num)
             self.updateActionState()
-            self.statusBar().showMessage(
-                f"Deleted {len(selected_pages)} page{'s' if len(selected_pages) != 1 else ''}.",
-                6000,
+            message = (
+                f"Deleted {len(selected_pages)} page{'s' if len(selected_pages) != 1 else ''}."
             )
+            if isinstance(self.images, CachedImages):
+                self.pending_status_message = message
+                self.reloadImages(set())
+            else:
+                self._status_bar.showMessage(message, 6000)
         except Exception as error:
             LOGGER.exception("Failed to delete selected pages.")
             restored = self._rollbackUndoSnapshot(snapshot)
@@ -2468,15 +2635,18 @@ class PDFViewer(QMainWindow):
             save_path = f"{save_path}.pdf"
 
         try:
-            pdf_bytes = self.pdf_doc.tobytes()
+            pdf_bytes = self.pdf_doc.tobytes(no_new_id=True)
         except Exception as error:
             QMessageBox.critical(self, "Error", f"Failed to prepare PDF for saving: {error}")
             return
 
+        self._processing_kind = "save"
+        self._operation_cancel_token = None
+        self.operation_progress.setRange(0, 0)
         self.setUIProcessing(True)
         self._operation_id += 1
         operation_id = self._operation_id
-        self.statusBar().showMessage("Saving PDF and provenance manifest...")
+        self._status_bar.showMessage("Saving PDF and provenance manifest...")
         fast_save_enabled = self.fast_save_action.isChecked()
         deflate_enabled = not fast_save_enabled
         garbage_level = 1 if fast_save_enabled else 2
@@ -2507,9 +2677,18 @@ class PDFViewer(QMainWindow):
         self.threadpool.start(worker)
 
     def updateActionState(self):
-        has_document = self.pdf_doc is not None and len(self.pdf_doc) > 0
+        has_document = self.pdf_doc is not None and (
+            len(self.images) > 0 if self.is_processing else len(self.pdf_doc) > 0
+        )
         available = has_document and not self.is_processing
-        coordinate_tools_available = available and abs(self._rotation_preview_angle) < 0.01
+        previews_available = available and not self._previews_incomplete
+        coordinate_tools_available = previews_available and abs(self._rotation_preview_angle) < 0.01
+        for view in (self.single_view, self.odd_view, self.even_view):
+            view.setEnabled(previews_available)
+        self.scroll_area.setEnabled(
+            has_document and (not self.is_processing or self._processing_kind == "render")
+        )
+        self._sync_thumbnail_selection()
         self.crop_tool_btn.setEnabled(coordinate_tools_available)
         self._updateCropToolIndicator(coordinate_tools_available)
         cover_available = coordinate_tools_available
@@ -2542,7 +2721,7 @@ class PDFViewer(QMainWindow):
             and bool(self._rotation_target_pages())
             and abs(self.rotation_angle_spin.value()) >= 0.01
         )
-        self.preview_rotation_btn.setEnabled(rotation_angle_ready)
+        self.preview_rotation_btn.setEnabled(rotation_angle_ready and previews_available)
         self.discard_rotation_preview_btn.setEnabled(
             available
             and (
@@ -2555,7 +2734,11 @@ class PDFViewer(QMainWindow):
             rotation_available and bool(self._rotation_target_pages()) and deskew_available()
         )
         self.delete_btn.setEnabled(available and bool(self.selected_pages))
-        self.view_stack_btn.setEnabled(available and self.preview_page_num is not None)
+        self.view_stack_btn.setEnabled(
+            has_document
+            and (not self.is_processing or self._processing_kind == "render")
+            and self.preview_page_num is not None
+        )
         self.rotation_options_toggle_btn.setEnabled(rotation_available)
         self.undo_btn.setEnabled(available and bool(self.undo_stack))
         self.undo_action.setEnabled(available and bool(self.undo_stack))
@@ -2563,11 +2746,82 @@ class PDFViewer(QMainWindow):
         self.reload_original_action.setEnabled(available)
         self.save_btn.setEnabled(available)
         self.save_action.setEnabled(available)
+        cancellable = self.is_processing and self._operation_cancel_token is not None
+        cancelling = cancellable and self._cancellation_requested()
+        self.cancel_operation_btn.setVisible(cancellable)
+        self.cancel_operation_btn.setEnabled(cancellable and not cancelling)
+        self.cancel_operation_btn.setText("Stopping..." if cancelling else "Cancel")
+        self.cancel_operation_action.setEnabled(cancellable and not cancelling)
+        self.operation_progress.setVisible(self.is_processing)
+        self.retry_previews_btn.setVisible(available and self._previews_incomplete)
+        self.retry_previews_btn.setEnabled(available and self._previews_incomplete)
+        self.retry_previews_action.setEnabled(available and self._previews_incomplete)
+
+    def _connect_worker_progress(self, worker, operation_id):
+        worker.signals.progress.connect(
+            lambda completed, total, operation_id=operation_id: self.processingProgress(
+                operation_id, completed, total
+            )
+        )
+        worker.signals.cancelled.connect(
+            lambda operation_id=operation_id: self.processingCancelled(operation_id)
+        )
+
+    def _cancellation_requested(self) -> bool:
+        token = self._operation_cancel_token
+        return token is not None and token.is_cancelled
+
+    def cancelOperation(self):
+        token = self._operation_cancel_token
+        if not self.is_processing or token is None or token.is_cancelled:
+            return False
+        token.cancel()
+        self._status_bar.showMessage("Cancelling; waiting for work already in progress...")
+        self.updateActionState()
+        return True
+
+    def processingProgress(self, operation_id, completed, total):
+        if (
+            operation_id != self._operation_id
+            or not self.is_processing
+            or self._cancellation_requested()
+        ):
+            return
+        self.operation_progress.setRange(0, max(0, int(total)))
+        self.operation_progress.setValue(max(0, min(int(completed), int(total))))
+        if self._processing_kind == "deskew":
+            if total > 0 and completed >= total:
+                self.operation_progress.setRange(0, 0)
+                self._status_bar.showMessage("Applying deskew corrections...")
+            else:
+                self._status_bar.showMessage(f"Analyzing skew: {completed}/{total} pages...")
+
+    def processingCancelled(self, operation_id):
+        if (
+            operation_id != self._operation_id
+            or not self.is_processing
+            or self._cancelled_operation_id == operation_id
+            or self._processing_kind not in {"render", "deskew"}
+        ):
+            return
+        self._cancelled_operation_id = operation_id
+        self._reload_after_processing = False
+        self._reload_render_pages = None
+        if self._processing_kind == "deskew":
+            self._release_rotation_snapshot()
+            self.pending_status_message = "Auto deskew cancelled. The document was not changed."
+        else:
+            self._previews_incomplete = True
+            self.pending_status_message = (
+                "Preview rendering cancelled. Edits remain applied; retry previews to continue."
+            )
 
     def setUIProcessing(self, is_processing):
         was_processing = self.is_processing
         self.is_processing = is_processing
-        self.menuBar().setEnabled(not is_processing)
+        menu_bar = self.menuBar()
+        if menu_bar is not None:
+            menu_bar.setEnabled(not is_processing)
         self.updateActionState()
 
         if is_processing and not was_processing:
@@ -2579,7 +2833,7 @@ class PDFViewer(QMainWindow):
         if operation_id != self._operation_id:
             return
         if result.get("manifest_error"):
-            self.statusBar().showMessage(
+            self._status_bar.showMessage(
                 "PDF saved, but the provenance manifest could not be finalized.", 10000
             )
             QMessageBox.warning(
@@ -2591,23 +2845,26 @@ class PDFViewer(QMainWindow):
         else:
             self.is_dirty = False
         if result.get("manifest_written"):
-            self.statusBar().showMessage("PDF and provenance manifest saved successfully.", 8000)
+            self._status_bar.showMessage("PDF and provenance manifest saved successfully.", 8000)
         elif not result.get("manifest_error"):
-            self.statusBar().showMessage("PDF saved successfully.", 8000)
+            self._status_bar.showMessage("PDF saved successfully.", 8000)
 
     def processingError(self, operation_id, error_str):
         if operation_id != self._operation_id:
             return
+        self._failed_operation_id = operation_id
         self.pending_status_message = ""
-        self.statusBar().showMessage("The operation failed.", 8000)
+        self._status_bar.showMessage("The operation failed.", 8000)
         QMessageBox.critical(self, "Error", f"An error occurred:\n{error_str}")
         LOGGER.error("Background operation failed:\n%s", error_str)
 
     def renderingError(self, operation_id, error_str):
         if operation_id != self._operation_id:
             return
+        self._failed_operation_id = operation_id
+        self._previews_incomplete = True
         self.pending_status_message = ""
-        self.statusBar().showMessage(
+        self._status_bar.showMessage(
             "Preview rendering failed; document edits remain applied.", 8000
         )
         QMessageBox.critical(
@@ -2617,18 +2874,50 @@ class PDFViewer(QMainWindow):
             "The document remains loaded and its edits remain applied.",
         )
         LOGGER.error("Preview rendering failed:\n%s", error_str)
+        self.updateActionState()
 
     def processingFinished(self, operation_id):
         if operation_id != self._operation_id:
             return
+        kind = self._processing_kind
+        if self._cancellation_requested() and self._failed_operation_id != operation_id:
+            self.processingCancelled(operation_id)
+        if kind in {"rotate", "deskew"}:
+            self._release_rotation_snapshot()
+        if (
+            kind == "render"
+            and self._failed_operation_id != operation_id
+            and self._cancelled_operation_id != operation_id
+            and not self._pending_render_pages
+            and isinstance(self.images, CachedImages)
+            and len(self.images.ready_pages) == len(self.images)
+            and self._preview_frame is not None
+            and self._preview_frame.generation == self.preview_cache.generation
+        ):
+            self._previews_incomplete = False
+            self.updateOverlay()
+            self._restore_active_crop_selections()
+        self._operation_cancel_token = None
+        self._processing_kind = None
         self.setUIProcessing(False)
+        if self._close_after_processing:
+            self._close_after_processing = False
+            if self.pending_status_message:
+                self._status_bar.showMessage(self.pending_status_message, 8000)
+                self.pending_status_message = ""
+            QTimer.singleShot(0, self.close)
+            return
         if self._reload_after_processing:
             self._reload_after_processing = False
-            self.reloadImages()
+            pages = self._reload_render_pages
+            self._reload_render_pages = None
+            self.reloadImages(pages)
             return
         if self.pending_status_message:
-            self.statusBar().showMessage(self.pending_status_message, 8000)
+            self._status_bar.showMessage(self.pending_status_message, 8000)
             self.pending_status_message = ""
+        elif kind == "render" and not self._previews_incomplete:
+            self._status_bar.showMessage(f"Ready. {len(self.images)} page previews available.")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -2641,6 +2930,11 @@ class PDFViewer(QMainWindow):
 
     def closeEvent(self, event):
         if self.is_processing:
+            if self._processing_kind in {"render", "deskew"}:
+                self._close_after_processing = True
+                self.cancelOperation()
+                event.ignore()
+                return
             QMessageBox.information(
                 self,
                 "Operation in Progress",
@@ -2654,5 +2948,6 @@ class PDFViewer(QMainWindow):
         if self.pdf_doc is not None:
             self.pdf_doc.close()
         self.undo_store.close()
+        self.preview_cache.close()
         QApplication.instance().removeEventFilter(self)
         super().closeEvent(event)

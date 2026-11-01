@@ -5,12 +5,15 @@ from __future__ import annotations
 import math
 import multiprocessing
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from functools import lru_cache
 from typing import Any
 
-import fitz
+import pymupdf as fitz
+
+from .processing import CancellationToken, iter_bounded_results
 
 DESKEW_MAX_ANGLE = 10.0
 DESKEW_RENDER_MAX_PIXELS = 1400
@@ -363,7 +366,7 @@ def detect_page_deskew_angle(page: fitz.Page) -> float | None:
 
     page_rect = page.rect
     longest_side = max(page_rect.width, page_rect.height, 1.0)
-    scale = min(2.0, max(0.5, DESKEW_RENDER_MAX_PIXELS / longest_side))
+    scale = min(2.0, (DESKEW_RENDER_MAX_PIXELS - 1) / longest_side)
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(scale, scale),
         colorspace=fitz.csGRAY,
@@ -417,16 +420,49 @@ def _detect_deskew_angles_parallel(
     pdf_bytes: bytes,
     page_numbers: list[int],
     worker_count: int,
+    *,
+    cancel_token: CancellationToken | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[int, float | None]:
     """Detect page angles concurrently using isolated PyMuPDF documents."""
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
+    total = len(page_numbers)
+    if on_progress is not None:
+        on_progress(0, total)
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
+
     context = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(
-        max_workers=worker_count,
-        mp_context=context,
-        initializer=_initialize_deskew_process,
-        initargs=(pdf_bytes,),
-    ) as executor:
-        return dict(executor.map(_detect_page_deskew_task, page_numbers))
+    detected_angles: dict[int, float | None] = {}
+    completed = 0
+    with (
+        ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=context,
+            initializer=_initialize_deskew_process,
+            initargs=(pdf_bytes,),
+        ) as executor,
+        closing(
+            iter_bounded_results(
+                executor,
+                _detect_page_deskew_task,
+                page_numbers,
+                max_pending=worker_count,
+                cancel_token=cancel_token,
+            )
+        ) as detected_results,
+    ):
+        for page_num, angle in detected_results:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            detected_angles[page_num] = angle
+            completed += 1
+            if on_progress is not None:
+                on_progress(completed, total)
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+    return detected_angles
 
 
 def deskew_pdf_bytes(
@@ -434,12 +470,18 @@ def deskew_pdf_bytes(
     page_numbers: Iterable[int],
     *,
     max_workers: int | None = None,
+    cancel_token: CancellationToken | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[bytes, dict[int, float], list[int]]:
     """Detect and apply skew corrections to the requested pages."""
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
     document = fitz.open("pdf", pdf_bytes)
     applied: dict[int, float] = {}
     undetected: list[int] = []
     try:
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
         targets = sorted({int(page_num) for page_num in page_numbers})
         for page_num in targets:
             if page_num < 0 or page_num >= len(document):
@@ -455,19 +497,43 @@ def deskew_pdf_bytes(
                 pdf_bytes,
                 targets,
                 worker_count,
+                cancel_token=cancel_token,
+                on_progress=on_progress,
             )
         else:
-            detected_angles = {
-                page_num: detect_page_deskew_angle(document[page_num]) for page_num in targets
-            }
+            detected_angles = {}
+            if on_progress is not None:
+                on_progress(0, len(targets))
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            for completed, page_num in enumerate(targets, start=1):
+                if cancel_token is not None:
+                    cancel_token.raise_if_cancelled()
+                angle = detect_page_deskew_angle(document[page_num])
+                detected_angles[page_num] = angle
+                if on_progress is not None:
+                    on_progress(completed, len(targets))
+                if cancel_token is not None:
+                    cancel_token.raise_if_cancelled()
 
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
         for page_num in targets:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
             angle = detected_angles[page_num]
             if angle is None:
                 undetected.append(page_num)
                 continue
             rotate_page_content(document, page_num, angle)
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
             applied[page_num] = angle
-        return document.tobytes(garbage=2, deflate=True), applied, undetected
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+        output = document.tobytes(garbage=2, deflate=True)
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+        return output, applied, undetected
     finally:
         document.close()

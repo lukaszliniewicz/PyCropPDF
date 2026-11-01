@@ -29,6 +29,9 @@ deskew = [
 dev = [
     "pytest>=8,<10",
     "ruff>=0.8,<1",
+    "basedpyright>=1.40.2,<2",
+    "vulture>=2.16,<3",
+    "import-linter>=2.15,<3",
 ]
 build = [
     "pyinstaller>=6.11,<7",
@@ -49,6 +52,34 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+extend-exclude = ["graphify-out", "tmp"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "B", "C4", "I", "PERF", "PIE", "RUF", "SIM", "UP"]
+
+[tool.basedpyright]
+include = ["pycroppdf", "scripts/check.py", "scripts/vulture_allowlist.py"]
+exclude = [".venv", "build", "dist", "graphify-out", "tmp"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportImportCycles = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+
+[tool.vulture]
+paths = ["pycroppdf", "tests", "run.py", "pycroppdf.py", "scripts/check.py", "scripts/vulture_allowlist.py"]
+min_confidence = 60
+
+[tool.importlinter]
+root_packages = ["pycroppdf"]
+
+[[tool.importlinter.contracts]]
+name = "No circular imports within pycroppdf"
+type = "acyclic_siblings"
+ancestors = ["pycroppdf"]
+
+[[tool.importlinter.contracts]]
+name = "Keep document logic below the window and entry point"
+type = "layers"
+containers = ["pycroppdf"]
+layers = ["run", "main_window", "workers | widgets | thumbnails | icons | state", "overlay_groups | rotation | provenance", "preview_images", "raster_geometry | raster_cache | processing"]
+exhaustive = true

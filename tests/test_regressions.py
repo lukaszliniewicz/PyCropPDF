@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import fitz
+import pymupdf as fitz
 from PyQt6.QtCore import QEvent, QMimeData, QPointF, QRectF, QSize, QSizeF, Qt, QUrl
 from PyQt6.QtGui import QColor, QDropEvent, QImage, QKeyEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox, QToolButton
@@ -60,7 +60,7 @@ class CoordinateRegressionTests(unittest.TestCase):
         self.assertEqual(tuple(translated), tuple(pending_crop))
         document.close()
 
-    def test_visual_mask_on_a_cropped_input_uses_the_visible_page_location(self):
+    def test_top_left_selection_maps_to_the_existing_cropbox_origin(self):
         document = fitz.open()
         page = document.new_page(width=600, height=800)
         page.set_cropbox(fitz.Rect(100, 100, 500, 700))
@@ -72,9 +72,7 @@ class CoordinateRegressionTests(unittest.TestCase):
             page,
             page.cropbox,
         )
-        page.draw_rect(mask_rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
-
-        self.assertEqual(tuple(page.get_drawings()[-1]["rect"]), (100.0, 100.0, 200.0, 200.0))
+        self.assertEqual(tuple(mask_rect), (100.0, 100.0, 200.0, 200.0))
         document.close()
 
     def test_stack_and_page_scene_coordinates_round_trip_through_pdf_space(self):
@@ -309,6 +307,39 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertLess(blue, 70)
         self.assertEqual(self.viewer.cover_operations[-1]["color"], [0.9216, 0.2745, 0.1765])
 
+    def test_cover_on_an_existing_cropbox_matches_the_selected_pixels_at_every_rotation(self):
+        for rotation in (0, 90, 180, 270):
+            with self.subTest(rotation=rotation):
+                if self.viewer.pdf_doc is not None:
+                    self.viewer.pdf_doc.close()
+                document = fitz.open()
+                page = document.new_page(width=600, height=800)
+                page.set_cropbox(fitz.Rect(100, 100, 500, 700))
+                page.set_rotation(rotation)
+                pixmap = page.get_pixmap()
+                image = QImage(
+                    pixmap.samples,
+                    pixmap.width,
+                    pixmap.height,
+                    pixmap.stride,
+                    QImage.Format.Format_RGB888,
+                ).copy()
+                self.viewer.pdf_doc = document
+                self.viewer.images = [image]
+                self.viewer.page_map = [0]
+                self.viewer.original_page_count = 1
+                self.viewer.cover_operations = []
+                self.viewer.cover_color = (0.0, 0.0, 0.0)
+                self.viewer.view_mode = "all"
+
+                with patch.object(self.viewer, "reloadImages"):
+                    self.viewer.applyCover(QRectF(0, 0, 80, 80), [0])
+
+                rendered = self.viewer.pdf_doc[0].get_pixmap()
+                self.assertEqual(self.viewer.pdf_doc[0].rotation, rotation)
+                self.assertEqual(rendered.pixel(40, 40), (0, 0, 0))
+                self.assertEqual(rendered.pixel(120, 120), (255, 255, 255))
+
     def test_cover_works_inside_a_crop_on_a_rotated_page_and_undo_preserves_crop(self):
         document = fitz.open()
         page = document.new_page(width=400, height=600)
@@ -471,24 +502,23 @@ class ViewerRegressionTests(unittest.TestCase):
         self.assertEqual(self.viewer.single_view.sceneRect().width(), 400)
         self.assertTrue(self.viewer.crop_btn.isEnabled())
 
-    def test_space_bar_pan_is_global_to_page_views(self):
-        target = self.viewer.rotation_angle_spin
-        QApplication.sendEvent(
-            target,
-            QKeyEvent(
-                QEvent.Type.KeyPress,
-                Qt.Key.Key_Space,
-                Qt.KeyboardModifier.NoModifier,
-            ),
-        )
+    def test_space_bar_pan_is_scoped_to_page_focus_and_release_clears_it(self):
+        self.viewer.updateActionState()
+        with patch.object(self.viewer.odd_view, "hasFocus", return_value=False):
+            QApplication.sendEvent(
+                self.viewer.rotation_angle_spin,
+                QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
+            )
+        self.assertTrue(all(not view._pan for view in self._page_views()))
+        with patch.object(self.viewer.odd_view, "hasFocus", return_value=True):
+            QApplication.sendEvent(
+                self.viewer.odd_view,
+                QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
+            )
         self.assertTrue(all(view._pan for view in self._page_views()))
         QApplication.sendEvent(
-            target,
-            QKeyEvent(
-                QEvent.Type.KeyRelease,
-                Qt.Key.Key_Space,
-                Qt.KeyboardModifier.NoModifier,
-            ),
+            self.viewer.rotation_angle_spin,
+            QKeyEvent(QEvent.Type.KeyRelease, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier),
         )
         self.assertTrue(all(not view._pan for view in self._page_views()))
 
@@ -736,11 +766,13 @@ class ViewerRegressionTests(unittest.TestCase):
             "rects": {0: (50.0, 60.0, 350.0, 510.0)},
             "image_dims": [(400, 600)],
         }
-        self.viewer.pushUndo()
-        self.viewer._rotation_undo_pushed = True
+        pending_snapshot = self.viewer.pushUndo(defer=True)
+        self.viewer._rotation_pending_snapshot = pending_snapshot
         self.viewer._operation_id = 1
+        self.viewer._processing_kind = "rotate"
+        self.viewer.setUIProcessing(True)
 
-        with patch.object(QMessageBox, "critical"):
+        with patch.object(QMessageBox, "critical") as critical:
             self.viewer.rotationFinished(
                 1,
                 {
@@ -749,11 +781,14 @@ class ViewerRegressionTests(unittest.TestCase):
                     "crop_rects": {1: (10.0, 10.0, 20.0, 20.0)},
                 },
             )
+        critical.assert_called_once()
+        self.viewer.processingFinished(1)
 
         self.assertIs(self.viewer.pdf_doc, document)
         self.assertFalse(document.is_closed)
         self.assertEqual(self.viewer.rotation_operations, [])
         self.assertEqual(self.viewer.undo_stack, [])
+        self.assertFalse(os.path.exists(pending_snapshot["pdf_path"]))
 
     def test_page_only_controls_use_consistent_label(self):
         controls = (

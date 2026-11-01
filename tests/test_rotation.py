@@ -5,9 +5,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import fitz
+import pymupdf as fitz
 
 from pycroppdf.rotation import (
+    DESKEW_RENDER_MAX_PIXELS,
+    _deskew_dependencies,
     deskew_available,
     deskew_pdf_bytes,
     detect_page_deskew_angle,
@@ -186,7 +188,13 @@ class PageRotationTests(unittest.TestCase):
                 max_workers=2,
             )
 
-        parallel_detection.assert_called_once_with(source_bytes, [0, 1, 2, 3], 2)
+        parallel_detection.assert_called_once_with(
+            source_bytes,
+            [0, 1, 2, 3],
+            2,
+            cancel_token=None,
+            on_progress=None,
+        )
         self.assertEqual(rotations, {0: 1.5, 2: -1.0})
         self.assertEqual(undetected, [1, 3])
         output = fitz.open("pdf", output_bytes)
@@ -216,6 +224,45 @@ class PageRotationTests(unittest.TestCase):
 
         transform_crops.assert_called_once_with(source_bytes, crop_rects, {0: 2.0})
         self.assertEqual(results[0]["crop_rects"], transformed)
+
+    @unittest.skipUnless(deskew_available(), "optional deskew dependency is not installed")
+    def test_deskew_render_respects_pixel_cap_for_large_rotated_and_a4_pages(self):
+        numpy, _determine_skew = _deskew_dependencies()
+        observed_shapes = []
+
+        def fake_determine_skew(image, **_kwargs):
+            observed_shapes.append(image.shape)
+            return None
+
+        oversized = fitz.open()
+        oversized.new_page(width=4000, height=1200)
+        oversized_bytes = oversized.tobytes()
+        oversized.close()
+
+        a4 = fitz.open()
+        a4.new_page(width=595, height=842)
+        a4_bytes = a4.tobytes()
+        a4.close()
+
+        with patch(
+            "pycroppdf.rotation._deskew_dependencies",
+            return_value=(numpy, fake_determine_skew),
+        ):
+            for rotation in (0, 90, 180, 270):
+                document = fitz.open("pdf", oversized_bytes)
+                document[0].set_rotation(rotation)
+                detect_page_deskew_angle(document[0])
+                document.close()
+
+            document = fitz.open("pdf", a4_bytes)
+            detect_page_deskew_angle(document[0])
+            document.close()
+
+        self.assertEqual(len(observed_shapes), 5)
+        self.assertTrue(
+            all(max(shape) <= DESKEW_RENDER_MAX_PIXELS for shape in observed_shapes),
+            observed_shapes,
+        )
 
     @unittest.skipUnless(deskew_available(), "optional deskew dependency is not installed")
     def test_optional_deskew_detects_a_known_text_skew(self):

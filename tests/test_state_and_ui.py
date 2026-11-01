@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import fitz
-from PyQt6.QtCore import QRectF, Qt
+import pymupdf as fitz
+from PyQt6.QtCore import QPoint, QRectF, Qt
 from PyQt6.QtGui import QImage
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -20,7 +20,7 @@ from pycroppdf.state import (
     remap_crop_info_after_deletions,
     remap_page_indices_after_deletions,
 )
-from pycroppdf.widgets import ThumbnailWidget
+from pycroppdf.thumbnails import ThumbnailDelegate, ThumbnailView
 from pycroppdf.workers import SaveWorker
 
 
@@ -177,7 +177,13 @@ class ViewerInteractionTests(unittest.TestCase):
         self.assertEqual(self.viewer.selected_pages, {2, 3, 4, 5, 6})
 
     def test_thumbnail_preview_click_does_not_select_and_checkbox_can_deselect(self):
-        thumbnail = ThumbnailWidget(2, QImage(80, 120, QImage.Format.Format_RGB888))
+        thumbnail = ThumbnailView()
+        image = QImage(80, 120, QImage.Format.Format_RGB888)
+        thumbnail.pages.set_source(3, lambda _page: image, lambda _page: True)
+        thumbnail.pages.set_state({2}, None, True)
+        thumbnail.resize(212, 400)
+        thumbnail.show()
+        self.app.processEvents()
         previews = []
         selections = []
         thumbnail.previewRequested.connect(previews.append)
@@ -185,13 +191,21 @@ class ViewerInteractionTests(unittest.TestCase):
             lambda page_num, modifiers, toggle: selections.append((page_num, modifiers, toggle))
         )
 
-        QTest.mouseClick(thumbnail.label, Qt.MouseButton.LeftButton)
+        cell = thumbnail.visualRect(thumbnail.pages.index(2))
+        QTest.mouseClick(
+            thumbnail.viewport(), Qt.MouseButton.LeftButton, pos=cell.topLeft() + QPoint(40, 80)
+        )
         self.assertEqual(previews, [2])
         self.assertEqual(selections, [])
 
-        thumbnail.checkbox.click()
+        QTest.mouseClick(
+            thumbnail.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=ThumbnailDelegate.checkbox_rect(cell).center(),
+        )
         self.assertEqual(selections[-1][0], 2)
         self.assertTrue(selections[-1][2])
+        thumbnail.close()
         thumbnail.deleteLater()
 
     def test_processing_cursor_is_entered_and_left_once(self):
