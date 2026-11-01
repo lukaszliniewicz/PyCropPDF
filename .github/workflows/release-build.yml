@@ -39,7 +39,7 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y desktop-file-utils libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0 xvfb xauth
+          sudo apt-get install -y desktop-file-utils libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0 libxcb-keysyms1 libxcb-icccm4 libxcb-shape0 xvfb xauth
       - name: Fetch and verify the pinned AppImage tools
         if: matrix.platform == 'linux'
         run: |
